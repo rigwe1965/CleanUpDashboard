@@ -1,0 +1,1250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Disk Cleanup Dashboard</title>
+<style>
+:root {
+  --bg: #ffffff;
+  --surface: #f5f8f6;
+  --surface2: #eaf2ed;
+  --border: #cdddd4;
+  --text: #1a2e24;
+  --muted: #6b7a72;
+  --safe: #2D7D4F;
+  --low: #3b82f6;
+  --medium: #f59e0b;
+  --high: #ef4444;
+  --accent: #2D7D4F;
+  --font: -apple-system, 'Segoe UI', sans-serif;
+  --radius: 8px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; min-height: 100vh; }
+
+/* ---- Layout ---- */
+header { display: flex; align-items: center; gap: 16px; padding: 16px 24px; background: var(--surface); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+header h1 { font-size: 18px; font-weight: 700; color: var(--text); flex: 1; }
+.status-pill { padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; letter-spacing: .5px; }
+.pill-idle    { background: #e2ede7; color: var(--muted); }
+.pill-scanning{ background: #dbeafe; color: #2563eb; }
+.pill-complete{ background: #dcf0e6; color: var(--safe); }
+.pill-error   { background: #fee2e2; color: var(--high); }
+#header-drive { display: none; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+#header-drive-badge { padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; background: #dcf0e6; color: var(--accent); border: 1px solid var(--accent); }
+#scan-btn { padding: 8px 20px; border-radius: var(--radius); border: none; cursor: pointer; font-size: 14px; font-weight: 600; background: var(--accent); color: #fff; transition: opacity .15s; }
+#scan-btn:hover { opacity: .85; }
+#scan-btn:disabled { opacity: .4; cursor: not-allowed; }
+#stop-btn { display: none; padding: 8px 20px; border-radius: var(--radius); border: 1.5px solid var(--high); background: transparent; color: var(--high); font-size: 14px; font-weight: 600; cursor: pointer; transition: background .15s; }
+#stop-btn:hover { background: #fee2e2; }
+
+/* ---- Progress ---- */
+#progress-wrap { display: none; padding: 10px 24px; background: var(--surface); border-bottom: 1px solid var(--border); }
+#progress-top { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+#progress-label { font-size: 12px; color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#progress-pct { font-size: 12px; font-weight: 700; color: var(--accent); width: 36px; text-align: right; flex-shrink: 0; }
+#progress-bar-bg { height: 5px; background: var(--border); border-radius: 999px; overflow: hidden; }
+#progress-bar { height: 100%; background: var(--accent); border-radius: 999px; width: 0%; transition: width .4s ease; }
+
+/* ---- Summary ---- */
+#summary { display: none; padding: 16px 24px; background: var(--surface); border-bottom: 1px solid var(--border); }
+#drives-scanned { font-size: 11px; color: var(--muted); margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#drives-scanned span { font-weight: 600; color: var(--text); }
+.drive-tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; background: #eaf2ed; color: var(--accent); border: 1px solid var(--accent); cursor: pointer; transition: background .15s; }
+.drive-tag:hover { background: #d0e8db; }
+.drive-tag.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.summary-grid { display: flex; gap: 10px; flex-wrap: wrap; }
+.stat-card { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; min-width: 110px; flex: 1; cursor: pointer; transition: border-color .15s, box-shadow .15s, background .15s; user-select: none; }
+.stat-card:hover { background: #fff; box-shadow: 0 2px 8px rgba(45,125,79,.12); border-color: var(--accent); }
+.stat-card.active { background: #fff; box-shadow: 0 2px 8px rgba(45,125,79,.18); border-color: var(--accent); border-width: 2px; }
+.stat-card .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 5px; }
+.stat-card .value { font-size: 20px; font-weight: 700; }
+.c-safe   { color: var(--safe); }
+.c-low    { color: var(--low); }
+.c-medium { color: var(--medium); }
+.c-high   { color: var(--high); }
+.c-accent { color: var(--accent); }
+
+/* ---- Tabs ---- */
+#tabs { display: flex; gap: 0; padding: 0 24px; background: var(--surface); border-bottom: 1px solid var(--border); overflow-x: auto; }
+.tab { padding: 11px 16px; cursor: pointer; font-size: 13px; font-weight: 500; color: var(--muted); border-bottom: 2px solid transparent; white-space: nowrap; transition: color .15s, border-color .15s; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* ---- Controls ---- */
+#controls { display: flex; gap: 8px; align-items: center; padding: 10px 24px; background: var(--surface2); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+#type-filter-bar { display: none; gap: 6px; align-items: center; padding: 6px 24px 8px; background: var(--surface2); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+#type-filter-bar .tf-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; font-weight: 600; white-space: nowrap; }
+.type-pill { padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; cursor: pointer; border: 1.5px solid #cdddd4; color: var(--muted); opacity: .7; transition: opacity .15s, border-color .15s, color .15s; }
+.type-pill:hover, .type-pill.active { opacity: 1; border-color: var(--accent); color: var(--accent); }
+#search { flex: 1; min-width: 180px; padding: 7px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); font-size: 13px; outline: none; }
+#search:focus { border-color: var(--accent); }
+.sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
+.risk-filter { display: flex; gap: 5px; }
+.risk-pill { padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 700; cursor: pointer; border: 1.5px solid transparent; opacity: .5; transition: opacity .15s; }
+.risk-pill:hover, .risk-pill.active { opacity: 1; }
+.rp-safe   { border-color: var(--safe);   color: var(--safe); }
+.rp-low    { border-color: var(--low);    color: var(--low); }
+.rp-medium { border-color: var(--medium); color: var(--medium); }
+.rp-high   { border-color: var(--high);   color: var(--high); }
+.ctrl-label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 5px; cursor: pointer; white-space: nowrap; }
+.ctrl-label input[type=checkbox] { accent-color: var(--accent); cursor: pointer; width: 14px; height: 14px; }
+#sel-count { font-size: 12px; color: var(--accent); font-weight: 600; white-space: nowrap; }
+#bulk-del-btn { padding: 6px 14px; border: none; border-radius: var(--radius); background: var(--high); color: #fff; font-size: 12px; font-weight: 600; cursor: pointer; display: none; white-space: nowrap; }
+#bulk-del-btn:hover { opacity: .85; }
+#bulk-restore-btn { padding: 6px 14px; border: 1px solid var(--low); border-radius: var(--radius); background: transparent; color: var(--low); font-size: 12px; font-weight: 600; cursor: pointer; display: none; white-space: nowrap; }
+#bulk-restore-btn:hover { background: #dbeafe; }
+
+/* ---- Table ---- */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+thead { position: sticky; top: 0; background: var(--surface); z-index: 1; }
+th { padding: 9px 12px; text-align: left; font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; white-space: nowrap; }
+th:not(.col-chk):hover { color: var(--text); }
+th.sortable::after       { content: ' ↕'; opacity: .3; }
+th.sort-asc::after       { content: ' ↑'; color: var(--accent); opacity: 1; }
+th.sort-desc::after      { content: ' ↓'; color: var(--accent); opacity: 1; }
+th.sortable:hover::after { opacity: .7; }
+td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+tr.data-row { cursor: pointer; }
+tr.data-row:hover td { background: var(--surface2); }
+tr.data-row.selected td { background: #dcf0e6; }
+
+/* Column widths */
+.col-chk  { width: 36px; cursor: default !important; }
+.col-path { width: 40%; }
+.col-size { width: 85px; text-align: right; }
+.col-risk { width: 88px; }
+.col-type { width: 110px; }
+.col-date { width: 110px; }
+.col-act  { width: 120px; }
+
+/* ---- Badges ---- */
+.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: .3px; }
+.badge-safe   { background: #dcf0e6; color: var(--safe); }
+.badge-low    { background: #dbeafe; color: var(--low); }
+.badge-medium { background: #fef3c7; color: var(--medium); }
+.badge-high   { background: #fee2e2; color: var(--high); }
+
+/* ---- Pagination ---- */
+#pagination { display: flex; gap: 8px; align-items: center; justify-content: center; padding: 14px; }
+.page-btn { padding: 5px 13px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface2); color: var(--text); cursor: pointer; font-size: 13px; }
+.page-btn:hover { background: var(--surface); }
+.page-btn:disabled { opacity: .3; cursor: not-allowed; }
+#page-info { font-size: 12px; color: var(--muted); }
+
+/* ---- Modal ---- */
+#modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 100; align-items: center; justify-content: center; }
+#modal-overlay.show { display: flex; }
+#modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 26px; max-width: 460px; width: 90%; }
+#modal h2 { font-size: 17px; margin-bottom: 8px; }
+#modal p.modal-sub  { color: var(--muted); margin-bottom: 14px; font-size: 13px; }
+#modal-permanent { display: none; margin-bottom: 14px; background: #fee2e233; border: 1px solid #fca5a5; border-radius: var(--radius); padding: 12px; }
+#modal-permanent p { color: var(--high); font-weight: 600; margin-bottom: 8px; font-size: 13px; }
+#modal-confirm-input { width: 100%; padding: 7px 12px; background: var(--bg); border: 1px solid var(--high); border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none; }
+.modal-btns { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+.btn-cancel { padding: 8px 16px; border-radius: var(--radius); border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; font-size: 13px; }
+.btn-cancel:hover { background: var(--surface2); }
+.btn-confirm { padding: 8px 16px; border-radius: var(--radius); border: none; background: var(--high); color: #fff; font-weight: 600; cursor: pointer; font-size: 13px; }
+.btn-confirm:hover { opacity: .85; }
+.btn-confirm:disabled { opacity: .35; cursor: not-allowed; }
+
+/* ---- Toast ---- */
+#toast { display: none; position: fixed; bottom: 20px; right: 20px; padding: 11px 18px; border-radius: var(--radius); font-size: 13px; font-weight: 600; z-index: 200; max-width: 320px; }
+#toast.success { background: #dcf0e6; color: var(--safe); border: 1px solid var(--safe); }
+#toast.error   { background: #fee2e2; color: var(--high); border: 1px solid var(--high); }
+
+/* ---- Action btns (row) ---- */
+.row-btns { display: flex; gap: 4px; }
+.row-act-btn { padding: 3px 9px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; }
+.row-act-btn:hover { background: var(--surface2); color: var(--text); }
+.row-restore-btn { border-color: var(--low); color: var(--low); }
+.row-restore-btn:hover { background: #dbeafe; }
+.row-remove-btn { border-color: var(--high); color: var(--high); }
+.row-remove-btn:hover { background: #fee2e2; }
+
+/* ---- Shift-select highlight ---- */
+tr.data-row.range-hover td { background: #dcf0e688; }
+
+#no-scan-banner { text-align: center; padding: 60px 24px; }
+#no-scan-banner h2 { font-size: 20px; color: var(--muted); margin-bottom: 8px; }
+
+/* ---- Card detail panel ---- */
+#card-detail { margin-top: 12px; padding: 14px 16px; background: #fff; border: 1px solid var(--border); border-radius: var(--radius); }
+.cd-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin-bottom: 8px; }
+.cd-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+.cd-chip { padding: 3px 10px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); background: var(--surface2); color: var(--muted); display: inline-flex; align-items: center; gap: 5px; }
+.cd-chip-val { font-weight: 700; color: var(--text); }
+.cd-desc { font-size: 12px; color: var(--muted); margin: 6px 0 8px; line-height: 1.5; }
+.cd-warn { font-size: 12px; font-weight: 600; margin-top: 6px; }
+.cd-note { font-size: 11px; color: var(--muted); margin-top: 6px; }
+.cd-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.reclaim-btn { padding: 6px 14px; border-radius: var(--radius); border: none; background: var(--accent); color: #fff; font-size: 12px; font-weight: 600; cursor: pointer; transition: opacity .15s; }
+.reclaim-btn:hover { opacity: .85; }
+#reclaim-bar { display: none; margin-bottom: 10px; align-items: center; gap: 10px; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+  <h1>&#128190; Disk Cleanup Dashboard</h1>
+  <div id="header-drive">
+    Scanning: <span id="header-drive-badge">C:\</span>
+  </div>
+  <span id="status-pill" class="status-pill pill-idle">IDLE</span>
+  <button id="stop-btn" onclick="App.stopScan()">&#9632; Stop Scan</button>
+  <button id="scan-btn" onclick="App.startScan()">Scan Now</button>
+</header>
+
+<!-- Progress -->
+<div id="progress-wrap">
+  <div id="progress-top">
+    <div id="progress-label">Starting scan…</div>
+    <div id="progress-pct">0%</div>
+  </div>
+  <div id="progress-bar-bg"><div id="progress-bar"></div></div>
+</div>
+
+<!-- Summary cards -->
+<div id="summary">
+  <div id="reclaim-bar" style="display:none;margin-bottom:10px">
+    <button id="reclaim-safe-btn"     class="reclaim-btn" onclick="App.initReclaim(['SAFE'])">&#9851; Reclaim Safe Files</button>
+    <button id="reclaim-low-btn"      class="reclaim-btn" style="background:var(--low);margin-left:6px" onclick="App.initReclaim(['SAFE','LOW'])">&#9851; Reclaim Safe + Low Risk</button>
+    <span id="reclaim-status" style="font-size:11px;color:var(--accent);font-weight:600;margin-left:10px"></span>
+    <span id="reclaim-hint"   style="font-size:11px;color:var(--muted);margin-left:6px"></span>
+  </div>
+  <div id="drives-scanned">Drives scanned:</div>
+  <div class="summary-grid">
+    <div class="stat-card" id="sc-total"  onclick="App.cardClick('total')"   title="Click to expand breakdown"><div class="label">Total Files</div><div class="value c-accent" id="s-total">—</div></div>
+    <div class="stat-card" id="sc-reclaim" onclick="App.cardClick('reclaim')" title="Click to expand reclaimable breakdown"><div class="label">Reclaimable</div><div class="value c-safe" id="s-reclaim">—</div></div>
+    <div class="stat-card" id="sc-safe"   onclick="App.cardClick('SAFE')"    title="Click to expand — safe to delete"><div class="label">Safe to Delete</div><div class="value c-safe" id="s-safe">—</div></div>
+    <div class="stat-card" id="sc-low"    onclick="App.cardClick('LOW')"     title="Click to expand — low risk"><div class="label">Low Risk</div><div class="value c-low" id="s-low">—</div></div>
+    <div class="stat-card" id="sc-medium" onclick="App.cardClick('MEDIUM')"  title="Click to expand — medium risk"><div class="label">Medium Risk</div><div class="value c-medium" id="s-medium">—</div></div>
+    <div class="stat-card" id="sc-high"   onclick="App.cardClick('HIGH')"    title="Click to expand — high risk"><div class="label">High Risk</div><div class="value c-high" id="s-high">—</div></div>
+  </div>
+  <div id="card-detail" style="display:none"></div>
+</div>
+
+<!-- Tabs -->
+<div id="tabs">
+  <div class="tab active" data-tab="all"        onclick="App.switchTab('all')">All Files</div>
+  <div class="tab"        data-tab="cache"       onclick="App.switchTab('cache')">Cache &amp; Junk</div>
+  <div class="tab"        data-tab="duplicates"  onclick="App.switchTab('duplicates')">Duplicates</div>
+  <div class="tab"        data-tab="large"       onclick="App.switchTab('large')">Large Files</div>
+  <div class="tab"        data-tab="trash"       onclick="App.switchTab('trash')">Trash</div>
+</div>
+
+<!-- Type filter bar (shown when data is loaded) -->
+<div id="type-filter-bar">
+  <span class="tf-label">Type:</span>
+  <span id="type-pills"></span>
+</div>
+
+<!-- Controls -->
+<div id="controls">
+  <input id="search" type="text" placeholder="Search by path…" oninput="App.onSearch(this.value)">
+  <div class="sep"></div>
+  <div class="risk-filter">
+    <div class="risk-pill rp-safe"   onclick="App.toggleRisk('SAFE')"  >SAFE <span id="rc-safe"></span></div>
+    <div class="risk-pill rp-low"    onclick="App.toggleRisk('LOW')"   >LOW <span id="rc-low"></span></div>
+    <div class="risk-pill rp-medium" onclick="App.toggleRisk('MEDIUM')">MED <span id="rc-med"></span></div>
+    <div class="risk-pill rp-high"   onclick="App.toggleRisk('HIGH')"  >HIGH <span id="rc-high"></span></div>
+  </div>
+  <div class="sep"></div>
+  <span id="sel-count"></span>
+  <button id="bulk-restore-btn" onclick="App.bulkRestoreTrash()">Restore Selected</button>
+  <button id="bulk-del-btn"     onclick="App.bulkDelete()">Delete Selected</button>
+</div>
+
+<!-- Table -->
+<div class="table-wrap" id="table-wrap">
+  <div id="no-scan-banner">
+    <h2>No scan data</h2>
+    <p style="color:var(--muted);margin-top:8px;">Click <strong>Scan Now</strong> in the header to analyse your drives.</p>
+  </div>
+  <table id="file-table" style="display:none;">
+    <thead>
+      <tr>
+        <th class="col-chk" style="cursor:default"><input type="checkbox" id="select-all" onchange="App.selectAll(this.checked)" style="accent-color:var(--accent);cursor:pointer;width:14px;height:14px" title="Select / deselect all on this page"></th>
+        <th class="col-path sortable" onclick="App.sortBy('path')">Path</th>
+        <th class="col-size sortable" onclick="App.sortBy('size')" style="text-align:right">Size</th>
+        <th class="col-risk sortable" onclick="App.sortBy('risk')">Risk</th>
+        <th class="col-type sortable" onclick="App.sortBy('type')">Type</th>
+        <th class="col-date sortable" onclick="App.sortBy('last_accessed')">Last Used</th>
+        <th class="col-act">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<!-- Pagination -->
+<div id="pagination" style="display:none;">
+  <button class="page-btn" id="prev-btn" onclick="App.paginate(-1)">&#8592; Prev</button>
+  <span id="page-info"></span>
+  <button class="page-btn" id="next-btn" onclick="App.paginate(1)">Next &#8594;</button>
+</div>
+
+<!-- Confirm Modal -->
+<div id="modal-overlay">
+  <div id="modal">
+    <h2 id="modal-title">Confirm</h2>
+    <p class="modal-sub" id="modal-desc"></p>
+    <div id="modal-permanent">
+      <p>&#9888; This cannot be undone. Type <strong>DELETE</strong> to confirm:</p>
+      <input id="modal-confirm-input" type="text" placeholder="Type DELETE" oninput="App.onPermInput(this.value)">
+    </div>
+    <div class="modal-btns">
+      <button class="btn-cancel" onclick="App.closeModal()">Cancel</button>
+      <button class="btn-confirm" id="modal-ok-btn" onclick="App.confirmDelete()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script>
+const App = (() => {
+  const state = {
+    activeTab: 'all',
+    sortCol: 'size',
+    sortDir: 'desc',
+    query: '',
+    page: 0,
+    total: 0,
+    pageSize: 100,
+    riskFilter: '',
+    driveFilter: '',
+    typeFilter: '',
+    selected: new Set(),       // Set of file IDs
+    scanStatus: 'idle',
+    modalIds: [],
+    modalPermanent: false,
+    modalType: null,           // 'delete' | 'reclaim'
+    modalRisks: [],
+    hasData: false,
+    lastClickIdx: -1,          // for shift-click range selection
+    currentRows: [],           // rows rendered this page (for shift-click)
+    scannedDrives: [],
+    summaryData: null,         // cached last /api/summary response
+    expandedCard: null,        // currently expanded card id
+  };
+
+  let searchTimer = null;
+  let sse = null;
+  let scanPoller = null;
+
+  // ---- Helpers ----
+  function fmt(bytes) {
+    if (!bytes) return '0 B';
+    const units = ['B','KB','MB','GB','TB'];
+    let n = bytes;
+    for (const u of units) {
+      if (n < 1024) return `${n.toFixed(1)} ${u}`;
+      n /= 1024;
+    }
+    return `${n.toFixed(1)} PB`;
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    try { return new Date(iso).toLocaleDateString(); } catch { return '—'; }
+  }
+
+  function riskBadge(risk) {
+    const cls = { SAFE:'safe', LOW:'low', MEDIUM:'medium', HIGH:'high' }[risk] || 'high';
+    return `<span class="badge badge-${cls}">${risk}</span>`;
+  }
+
+  function toast(msg, type = 'success') {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.className = type;
+    el.style.display = 'block';
+    clearTimeout(el._t);
+    el._t = setTimeout(() => { el.style.display = 'none'; }, 3500);
+  }
+
+  function setPill(status) {
+    const el = document.getElementById('status-pill');
+    const labels = { idle:'IDLE', scanning:'SCANNING…', complete:'DONE', error:'ERROR', cancelled:'CANCELLED' };
+    el.textContent = labels[status] || status.toUpperCase();
+    el.className = `status-pill pill-${status}`;
+  }
+
+  function setDriveBadge(drive, show) {
+    const wrap = document.getElementById('header-drive');
+    const badge = document.getElementById('header-drive-badge');
+    if (show && drive) {
+      badge.textContent = drive + ':\\';
+      wrap.style.display = 'flex';
+    } else {
+      wrap.style.display = 'none';
+    }
+  }
+
+  function updateSelCount() {
+    const n = state.selected.size;
+    const isTrash = state.activeTab === 'trash';
+    document.getElementById('sel-count').textContent = n ? `${n} selected` : '';
+    document.getElementById('bulk-del-btn').style.display = n > 0 ? 'inline-block' : 'none';
+    document.getElementById('bulk-del-btn').textContent = isTrash ? 'Permanent Delete' : 'Delete Selected';
+    document.getElementById('bulk-restore-btn').style.display = (n > 0 && isTrash) ? 'inline-block' : 'none';
+  }
+
+  // ---- Init ----
+  async function init() {
+    try {
+      const r = await fetch('/api/status');
+      const d = await r.json();
+      state.scanStatus = d.status;
+      setPill(d.status);
+      if (d.status === 'complete' || d.status === 'scanning') {
+        await Promise.all([loadSummary(), loadResults()]);
+      }
+      if (d.status === 'scanning') {
+        // Restore scan UI state after page refresh
+        document.getElementById('scan-btn').disabled = true;
+        document.getElementById('stop-btn').style.display = 'inline-block';
+        showProgress(true);
+        const pct = d.pct || 0;
+        document.getElementById('progress-bar').style.width = pct + '%';
+        document.getElementById('progress-pct').textContent = pct + '%';
+        document.getElementById('progress-label').textContent = d.phase || 'Scanning\u2026';
+        openSSE();
+        startScanPoller();
+      }
+    } catch (e) {}
+  }
+
+  // ---- Scan ----
+  async function startScan() {
+    if (state.scanStatus === 'scanning') return;
+    state.selected.clear();
+    updateSelCount();
+    try {
+      const r = await fetch('/api/scan/start', { method: 'POST' });
+      const d = await r.json();
+      if (d.error) { toast(d.error, 'error'); return; }
+    } catch (e) { toast('Could not start scan', 'error'); return; }
+    state.scanStatus = 'scanning';
+    setPill('scanning');
+    document.getElementById('scan-btn').disabled = true;
+    document.getElementById('stop-btn').style.display = 'inline-block';
+    showProgress(true);
+    openSSE();
+    startScanPoller();
+  }
+
+  function startScanPoller() {
+    stopScanPoller();
+    // First refresh after 2s to let the first batch commit, then every 3s
+    setTimeout(async () => {
+      if (state.scanStatus === 'scanning') {
+        state.hasData = true;
+        await Promise.all([loadSummary(), loadResults()]);
+      }
+    }, 2000);
+    scanPoller = setInterval(async () => {
+      if (state.scanStatus !== 'scanning') { stopScanPoller(); return; }
+      state.hasData = true;
+      await Promise.all([loadSummary(), loadResults()]);
+    }, 3000);
+  }
+
+  function stopScanPoller() {
+    if (scanPoller) { clearInterval(scanPoller); scanPoller = null; }
+  }
+
+  async function stopScan() {
+    try {
+      await fetch('/api/scan/cancel', { method: 'POST' });
+      stopScanPoller();
+      document.getElementById('stop-btn').style.display = 'none';
+    } catch (e) { toast('Could not stop scan', 'error'); }
+  }
+
+  function openSSE() {
+    if (sse) { sse.close(); sse = null; }
+    sse = new EventSource('/api/scan/progress');
+    sse.onmessage = (e) => {
+      const d = JSON.parse(e.data);
+      updateProgress(d);
+      if (d.status === 'complete') {
+        sse.close(); sse = null;
+        onScanComplete();
+      } else if (d.status === 'error' || d.status === 'cancelled') {
+        sse.close(); sse = null;
+        stopScanPoller();
+        setPill(d.status);
+        showProgress(false);
+        setDriveBadge('', false);
+        document.getElementById('scan-btn').disabled = false;
+        document.getElementById('stop-btn').style.display = 'none';
+        toast('Scan ' + d.status, d.status === 'cancelled' ? 'success' : 'error');
+      }
+    };
+    sse.onerror = () => { sse.close(); sse = null; };
+  }
+
+  function updateProgress(d) {
+    const pct = d.pct || 0;
+    document.getElementById('progress-bar').style.width = pct + '%';
+    document.getElementById('progress-pct').textContent = pct + '%';
+    const ff = d.files_found ? ` — ${d.files_found.toLocaleString()} files` : '';
+    // Show a short path snippet, not the full phase string
+    const phase = d.phase || 'Scanning';
+    document.getElementById('progress-label').textContent = `${phase}${ff}`;
+    // Drive badge in header
+    if (d.drive) setDriveBadge(d.drive, true);
+  }
+
+  function showProgress(show) {
+    document.getElementById('progress-wrap').style.display = show ? 'block' : 'none';
+  }
+
+  async function onScanComplete() {
+    state.scanStatus = 'complete';
+    setPill('complete');
+    document.getElementById('scan-btn').disabled = false;
+    document.getElementById('progress-bar').style.width = '100%';
+    document.getElementById('progress-pct').textContent = '100%';
+    document.getElementById('progress-label').textContent = 'Scan complete!';
+    stopScanPoller();
+    document.getElementById('stop-btn').style.display = 'none';
+    setDriveBadge('', false);
+    setTimeout(() => showProgress(false), 1800);
+    state.page = 0;
+    await Promise.all([loadSummary(), loadResults()]);
+  }
+
+  // ---- Summary ----
+  async function loadSummary() {
+    try {
+      const r = await fetch('/api/summary');
+      const d = await r.json();
+      renderSummary(d);
+    } catch (e) {}
+  }
+
+  function renderSummary(d) {
+    state.summaryData = d;
+    const br = d.by_risk || {};
+    const total = Object.values(br).reduce((a, v) => a + (v.count || 0), 0);
+    if (!total) return;
+    document.getElementById('summary').style.display = 'block';
+    state.hasData = true;
+    document.getElementById('no-scan-banner').style.display = 'none';
+    // Show reclaim bar if there are SAFE or LOW files
+    const safeCount = (br.SAFE || {}).count || 0;
+    const lowCount = (br.LOW || {}).count || 0;
+    const reclaimBar = document.getElementById('reclaim-bar');
+    if (reclaimBar) {
+      reclaimBar.style.display = (safeCount + lowCount) > 0 ? 'block' : 'none';
+      const hint = document.getElementById('reclaim-hint');
+      if (hint) hint.textContent = `${fmt((br.SAFE||{}).size||0 + (br.LOW||{}).size||0)} available · MEDIUM/HIGH excluded for safety`;
+    }
+
+    // Drives scanned from meta
+    const meta = d.scan_meta || {};
+    const driveSpace = d.drive_space || {};
+    const drivesEl = document.getElementById('drives-scanned');
+    if (meta.drives) {
+      try {
+        const drivesArr = JSON.parse(meta.drives.replace(/'/g, '"'));
+        const tags = drivesArr.map(p => {
+          const letter = p.match(/^([A-Z]):/i)?.[1]?.toUpperCase() || p[0].toUpperCase();
+          const activeCls = state.driveFilter === letter ? ' active' : '';
+          const root = letter + ':\\';
+          const sp = driveSpace[root];
+          const freeStr = sp ? ` · <span style="color:#2D7D4F;font-weight:600">${fmt(sp.free)} free</span>` : '';
+          return `<span class="drive-tag${activeCls}" onclick="App.filterByDrive('${letter}')">&#128190; ${letter}:\\ <small style="font-weight:400;opacity:.8">${p.replace(/^[A-Za-z]:\\/, '') || 'all'}</small>${freeStr}</span>`;
+        }).join(' ');
+        drivesEl.innerHTML = `Drives scanned: ${tags}`;
+        state.scannedDrives = drivesArr;
+      } catch {
+        drivesEl.textContent = 'Drives scanned: ' + (meta.drives || '');
+      }
+    } else {
+      drivesEl.style.display = 'none';
+    }
+
+    const get = (risk) => br[risk] || { count: 0, size: 0 };
+    document.getElementById('s-total').textContent = total.toLocaleString();
+    document.getElementById('s-reclaim').textContent = fmt(d.reclaimable || 0);
+    document.getElementById('s-safe').textContent = fmt(get('SAFE').size);
+    document.getElementById('s-low').textContent = fmt(get('LOW').size);
+    document.getElementById('s-medium').textContent = fmt(get('MEDIUM').size);
+    document.getElementById('s-high').textContent = get('HIGH').count.toLocaleString() + ' files';
+
+    // Risk pill counters — update after every summary refresh
+    const setRc = (id, n) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = n > 0 ? `(${n.toLocaleString()})` : '';
+    };
+    setRc('rc-safe',  get('SAFE').count);
+    setRc('rc-low',   get('LOW').count);
+    setRc('rc-med',   get('MEDIUM').count);
+    setRc('rc-high',  get('HIGH').count);
+
+    // Type filter pills
+    const byType = d.by_type || {};
+    const typeEntries = Object.entries(byType).filter(([,n]) => n > 0);
+    const pillsEl = document.getElementById('type-pills');
+    const barEl = document.getElementById('type-filter-bar');
+    if (pillsEl && typeEntries.length) {
+      pillsEl.innerHTML = typeEntries.map(([t, n]) => {
+        const active = state.typeFilter === t ? ' active' : '';
+        return `<span class="type-pill${active}" data-type="${t}" onclick="App.toggleType('${t}')">${t} <span style="opacity:.65">(${n.toLocaleString()})</span></span>`;
+      }).join(' ');
+      barEl.style.display = 'flex';
+    } else if (barEl) {
+      barEl.style.display = 'none';
+    }
+
+    // Tab count badges
+    const tabCounts = {
+      cache:      { label: 'Cache & Junk', count: d.cache_count || 0 },
+      duplicates: { label: 'Duplicates',   count: d.dup_count   || 0 },
+      large:      { label: 'Large Files',  count: d.large_count || 0 },
+      trash:      { label: 'Trash',        count: d.trash_count || 0 },
+    };
+    Object.entries(tabCounts).forEach(([tab, { label, count }]) => {
+      const el = document.querySelector(`.tab[data-tab="${tab}"]`);
+      if (el) el.textContent = count > 0 ? `${label} (${count.toLocaleString()})` : label;
+    });
+  }
+
+  // ---- Results ----
+  async function loadResults() {
+    const qs = new URLSearchParams({
+      tab: state.activeTab,
+      sort: state.sortCol,
+      dir: state.sortDir,
+      page: state.page,
+    });
+    if (state.query) qs.set('q', state.query);
+    if (state.riskFilter) qs.set('risk', state.riskFilter);
+    if (state.driveFilter) qs.set('drive', state.driveFilter);
+    if (state.typeFilter) qs.set('type', state.typeFilter);
+    try {
+      const r = await fetch(`/api/results?${qs}`);
+      const d = await r.json();
+      if (d.error) { toast(d.error, 'error'); return; }
+      state.total = d.total;
+      state.currentRows = d.results;
+      state.lastClickIdx = -1;
+      renderTable(d.results);
+    } catch (e) {}
+  }
+
+  function renderTable(rows) {
+    const tbody = document.getElementById('tbody');
+    const table = document.getElementById('file-table');
+    const banner = document.getElementById('no-scan-banner');
+
+    if (!state.hasData) {
+      banner.style.display = 'block';
+      table.style.display = 'none';
+      document.getElementById('pagination').style.display = 'none';
+      return;
+    }
+
+    table.style.display = 'table';
+    banner.style.display = 'none';
+
+    if (!rows.length) {
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">No files match this filter.</td></tr>`;
+      document.getElementById('pagination').style.display = 'none';
+      return;
+    }
+
+    const isTrash = state.activeTab === 'trash';
+
+    tbody.innerHTML = rows.map((row, idx) => {
+      const checked = state.selected.has(row.id) ? 'checked' : '';
+      const selCls = state.selected.has(row.id) ? ' selected' : '';
+      // Show drive letter badge before path
+      const driveLetter = row.drive || row.path[0];
+      const shortPath = row.path.length > 65 ? '…' + row.path.slice(-63) : row.path;
+      const driveTag = `<span style="font-size:10px;font-weight:700;color:#2D7D4F;margin-right:4px;opacity:.7">${driveLetter}:</span>`;
+
+      let actionBtns;
+      if (isTrash) {
+        actionBtns = `
+          <div class="row-btns">
+            <button class="row-act-btn row-restore-btn" onclick="event.stopPropagation();App.restoreFile('${row.id}')">Restore</button>
+            <button class="row-act-btn row-remove-btn"  onclick="event.stopPropagation();App.removeFromList('${row.id}')">Delete</button>
+          </div>`;
+      } else {
+        actionBtns = `<button class="row-act-btn" onclick="event.stopPropagation();App.openDeleteModal(['${row.id}'],false)">Delete</button>`;
+      }
+
+      return `<tr class="data-row${selCls}" data-id="${row.id}" data-idx="${idx}" onclick="App.rowClick(event,'${row.id}',${idx})">
+        <td class="col-chk" onclick="event.stopPropagation()"><input type="checkbox" ${checked} onchange="App.toggleSelect('${row.id}',this.checked,${idx})" style="accent-color:var(--accent);cursor:pointer"></td>
+        <td class="col-path" title="${row.path}">${driveTag}${shortPath}</td>
+        <td class="col-size" style="text-align:right">${fmt(row.size)}</td>
+        <td class="col-risk">${riskBadge(row.risk)}</td>
+        <td class="col-type" style="color:var(--muted);font-size:12px">${row.type}</td>
+        <td class="col-date" style="color:var(--muted);font-size:12px">${fmtDate(row.last_accessed)}</td>
+        <td class="col-act" onclick="event.stopPropagation()">${actionBtns}</td>
+      </tr>`;
+    }).join('');
+
+    // Pagination
+    const totalPages = Math.ceil(state.total / state.pageSize);
+    const pag = document.getElementById('pagination');
+    if (state.total > state.pageSize) {
+      pag.style.display = 'flex';
+      document.getElementById('prev-btn').disabled = state.page === 0;
+      document.getElementById('next-btn').disabled = state.page >= totalPages - 1;
+      document.getElementById('page-info').textContent =
+        `Page ${state.page + 1} of ${totalPages} (${state.total.toLocaleString()} files)`;
+    } else {
+      pag.style.display = 'none';
+    }
+
+    // Sort indicators
+    document.querySelectorAll('th').forEach(th => th.classList.remove('sort-asc','sort-desc'));
+    const colIdx = { path:1, size:2, risk:3, type:4, last_accessed:5 }[state.sortCol];
+    if (colIdx !== undefined) {
+      const th = document.querySelectorAll('thead th')[colIdx];
+      if (th) th.classList.add(state.sortDir === 'asc' ? 'sort-asc' : 'sort-desc');
+    }
+
+    // Sync select-all checkbox
+    const allOnPage = rows.every(r => state.selected.has(r.id));
+    document.getElementById('select-all').checked = rows.length > 0 && allOnPage;
+  }
+
+  // ---- Interactions ----
+  function switchTab(tab) {
+    state.activeTab = tab;
+    state.page = 0;
+    state.selected.clear();
+    state.lastClickIdx = -1;
+    updateSelCount();
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+    loadResults();
+  }
+
+  function sortBy(col) {
+    if (state.sortCol === col) {
+      state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      state.sortCol = col;
+      state.sortDir = 'desc';
+    }
+    state.page = 0;
+    loadResults();
+  }
+
+  function onSearch(val) {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      state.query = val.trim();
+      state.page = 0;
+      loadResults();
+    }, 300);
+  }
+
+  function filterByDrive(letter) {
+    // Toggle: clicking the active drive clears the filter
+    state.driveFilter = state.driveFilter === letter ? '' : letter;
+    state.page = 0;
+    state.selected.clear();
+    updateSelCount();
+    // Re-render drive tags to reflect active state
+    loadSummary();
+    loadResults();
+  }
+
+  function toggleRisk(risk) {
+    state.riskFilter = state.riskFilter === risk ? '' : risk;
+    state.page = 0;
+    document.querySelectorAll('.risk-pill').forEach(p => p.classList.remove('active'));
+    if (state.riskFilter) {
+      const map = { SAFE:'rp-safe', LOW:'rp-low', MEDIUM:'rp-medium', HIGH:'rp-high' };
+      document.querySelector('.' + map[state.riskFilter])?.classList.add('active');
+    }
+    loadResults();
+  }
+
+  function toggleType(type) {
+    state.typeFilter = state.typeFilter === type ? '' : type;
+    state.page = 0;
+    document.querySelectorAll('.type-pill').forEach(p => p.classList.remove('active'));
+    if (state.typeFilter) {
+      document.querySelector(`.type-pill[data-type="${state.typeFilter}"]`)?.classList.add('active');
+    }
+    loadResults();
+  }
+
+  // ---- Bulk selection ----
+  function rowClick(event, id, idx) {
+    if (event.shiftKey && state.lastClickIdx >= 0) {
+      // Shift-click: select range
+      const lo = Math.min(state.lastClickIdx, idx);
+      const hi = Math.max(state.lastClickIdx, idx);
+      const shouldCheck = !state.selected.has(id); // toggle direction based on target
+      for (let i = lo; i <= hi; i++) {
+        const row = state.currentRows[i];
+        if (!row) continue;
+        if (shouldCheck) state.selected.add(row.id);
+        else state.selected.delete(row.id);
+        const tr = document.querySelector(`tr[data-id="${row.id}"]`);
+        const cb = tr?.querySelector('input[type=checkbox]');
+        if (tr) tr.classList.toggle('selected', shouldCheck);
+        if (cb) cb.checked = shouldCheck;
+      }
+    } else {
+      // Normal click: toggle this row
+      const checked = !state.selected.has(id);
+      if (checked) state.selected.add(id);
+      else state.selected.delete(id);
+      const tr = document.querySelector(`tr[data-id="${id}"]`);
+      const cb = tr?.querySelector('input[type=checkbox]');
+      if (tr) tr.classList.toggle('selected', checked);
+      if (cb) cb.checked = checked;
+      state.lastClickIdx = idx;
+    }
+    updateSelCount();
+    // Sync select-all
+    const allOnPage = state.currentRows.every(r => state.selected.has(r.id));
+    document.getElementById('select-all').checked = state.currentRows.length > 0 && allOnPage;
+  }
+
+  function toggleSelect(id, checked, idx) {
+    if (checked) state.selected.add(id);
+    else state.selected.delete(id);
+    const tr = document.querySelector(`tr[data-id="${id}"]`);
+    if (tr) tr.classList.toggle('selected', checked);
+    state.lastClickIdx = idx;
+    updateSelCount();
+  }
+
+  function selectAll(checked) {
+    state.currentRows.forEach(row => {
+      if (checked) state.selected.add(row.id);
+      else state.selected.delete(row.id);
+      const tr = document.querySelector(`tr[data-id="${row.id}"]`);
+      const cb = tr?.querySelector('input[type=checkbox]');
+      if (tr) tr.classList.toggle('selected', checked);
+      if (cb) cb.checked = checked;
+    });
+    updateSelCount();
+  }
+
+  function selectBySafe() {
+    state.currentRows.forEach(row => {
+      if (row.risk === 'SAFE') {
+        state.selected.add(row.id);
+        const tr = document.querySelector(`tr[data-id="${row.id}"]`);
+        const cb = tr?.querySelector('input[type=checkbox]');
+        if (tr) tr.classList.add('selected');
+        if (cb) cb.checked = true;
+      }
+    });
+    updateSelCount();
+  }
+
+  function paginate(dir) {
+    const totalPages = Math.ceil(state.total / state.pageSize);
+    state.page = Math.max(0, Math.min(state.page + dir, totalPages - 1));
+    loadResults();
+  }
+
+  // ---- Bulk actions ----
+  async function bulkDelete() {
+    const ids = [...state.selected];
+    if (!ids.length) return;
+    if (state.activeTab === 'trash') {
+      try {
+        const r = await fetch('/api/trash/remove', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ ids }),
+        });
+        const d = await r.json();
+        if (d.removed > 0 || d.ok) {
+          state.selected.clear();
+          updateSelCount();
+          const freed = d.bytes_freed ? ` · ${fmt(d.bytes_freed)} freed` : '';
+          toast(`${d.removed} file(s) permanently deleted${freed}`);
+          await loadResults();
+          await loadSummary();
+        }
+        if (d.failed && d.failed.length) {
+          toast(`${d.failed.length} file(s) could not be deleted`, 'error');
+        }
+        if (!d.ok && !d.removed) {
+          toast(d.error || 'Delete failed', 'error');
+        }
+      } catch (e) { toast('Delete failed', 'error'); }
+    } else {
+      openDeleteModal(ids, false, false);
+    }
+  }
+
+  async function bulkRestoreTrash() {
+    const ids = [...state.selected];
+    if (!ids.length) return;
+    let done = 0;
+    for (const id of ids) {
+      try {
+        const r = await fetch('/api/trash/restore', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({id}),
+        });
+        const d = await r.json();
+        if (d.ok) done++;
+      } catch {}
+    }
+    if (done) {
+      toast(`${done} file(s) restored`);
+      state.selected.clear();
+      updateSelCount();
+      await loadResults();
+      await loadSummary();
+    }
+  }
+
+  // ---- Delete Flow ----
+  // isTrashRemove = true means removing from our list (already in Recycle Bin)
+  function openDeleteModal(ids, permanent, isTrashRemove = false) {
+    if (!ids.length) return;
+    state.modalIds = ids;
+    state.modalPermanent = permanent;
+    state.modalIsTrashRemove = isTrashRemove;
+
+    if (isTrashRemove) {
+      document.getElementById('modal-title').textContent = 'Permanently Delete Files';
+      document.getElementById('modal-desc').textContent =
+        `${ids.length} file(s) will be permanently deleted from the Recycle Bin. This frees the disk space and cannot be undone.`;
+      document.getElementById('modal-permanent').style.display = 'none';
+      document.getElementById('modal-ok-btn').textContent = 'Delete Forever';
+      document.getElementById('modal-ok-btn').disabled = false;
+    } else if (permanent) {
+      document.getElementById('modal-title').textContent = 'Permanently Delete Files';
+      document.getElementById('modal-desc').textContent =
+        `${ids.length} file(s) will be securely wiped and cannot be recovered.`;
+      document.getElementById('modal-permanent').style.display = 'block';
+      document.getElementById('modal-confirm-input').value = '';
+      document.getElementById('modal-ok-btn').textContent = 'Delete Permanently';
+      document.getElementById('modal-ok-btn').disabled = true;
+    } else {
+      document.getElementById('modal-title').textContent = 'Move to Recycle Bin';
+      document.getElementById('modal-desc').textContent =
+        `${ids.length} file(s) will be moved to the Windows Recycle Bin. You can restore them from there.`;
+      document.getElementById('modal-permanent').style.display = 'none';
+      document.getElementById('modal-ok-btn').textContent = 'Move to Recycle Bin';
+      document.getElementById('modal-ok-btn').disabled = false;
+    }
+
+    document.getElementById('modal-overlay').classList.add('show');
+  }
+
+  function onPermInput(val) {
+    document.getElementById('modal-ok-btn').disabled = val.trim() !== 'DELETE';
+  }
+
+  function closeModal() {
+    document.getElementById('modal-overlay').classList.remove('show');
+    state.modalIds = [];
+    state.modalType = null;
+    state.modalRisks = [];
+  }
+
+  async function confirmDelete() {
+    if (state.modalType === 'reclaim') {
+      const risks = state.modalRisks;
+      closeModal();
+      await executeReclaim(risks);
+      return;
+    }
+    const { modalIds: ids, modalPermanent: permanent, modalIsTrashRemove } = state;
+    if (!ids.length) return;
+    if (permanent && document.getElementById('modal-confirm-input').value.trim() !== 'DELETE') return;
+    closeModal();
+
+    try {
+      const r = await fetch('/api/delete', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ ids, permanent }),
+      });
+      const d = await r.json();
+      if (d.succeeded && d.succeeded.length) {
+        ids.forEach(id => state.selected.delete(id));
+        updateSelCount();
+        const verb = modalIsTrashRemove ? 'removed from list' : permanent ? 'permanently deleted' : 'moved to Recycle Bin';
+        toast(`${d.succeeded.length} file(s) ${verb}`);
+        await loadSummary();
+        await loadResults();
+      }
+      if (d.failed && d.failed.length) {
+        const reasons = [...new Set(d.failed.map(f => f.reason).filter(Boolean))];
+        const detail = reasons.length ? ` — ${reasons[0]}${reasons.length > 1 ? ` (+${reasons.length - 1} more)` : ''}` : '';
+        toast(`${d.failed.length} file(s) could not be processed${detail}`, 'error');
+      }
+      if (!d.succeeded?.length && !d.failed?.length) {
+        toast(d.error || 'No files were processed', 'error');
+      }
+    } catch (e) {
+      toast('Action failed: ' + e.message, 'error');
+    }
+  }
+
+  async function restoreFile(id) {
+    try {
+      const r = await fetch('/api/trash/restore', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({id}),
+      });
+      const d = await r.json();
+      if (d.ok) {
+        toast('File restored');
+        await loadResults();
+        await loadSummary();
+      } else {
+        toast(d.error || 'Restore failed', 'error');
+      }
+    } catch (e) { toast('Restore failed', 'error'); }
+  }
+
+  async function removeFromList(id) {
+    try {
+      const r = await fetch('/api/trash/remove', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ ids: [id] }),
+      });
+      const d = await r.json();
+      if (d.removed > 0 || d.ok) {
+        state.selected.delete(id);
+        updateSelCount();
+        const freed = d.bytes_freed ? ` · ${fmt(d.bytes_freed)} freed` : '';
+        toast(`Permanently deleted${freed}`);
+        await loadResults();
+        await loadSummary();
+      } else {
+        toast(d.error || 'Remove failed', 'error');
+      }
+    } catch (e) { toast('Remove failed', 'error'); }
+  }
+
+  // ---- Card click: filter + expand detail panel ----
+  function cardClick(cardId) {
+    if (state.expandedCard === cardId) {
+      // Collapse
+      state.expandedCard = null;
+      document.getElementById('card-detail').style.display = 'none';
+      document.querySelectorAll('.stat-card').forEach(c => c.classList.remove('active'));
+      return;
+    }
+    state.expandedCard = cardId;
+    if (cardId === 'total') { cardFilter(''); }
+    else if (cardId === 'reclaim') { cardSortSize(); }
+    else { cardFilter(cardId); }
+    renderCardDetail(cardId);
+  }
+
+  function renderCardDetail(cardId) {
+    const el = document.getElementById('card-detail');
+    const d = state.summaryData;
+    if (!d || !el) return;
+    const br = d.by_risk || {};
+    const bc = d.by_category || {};
+    const get = r => br[r] || { count: 0, size: 0 };
+    let html = '';
+
+    if (cardId === 'total') {
+      const entries = Object.entries(bc).filter(([,v]) => v.count > 0).sort((a,b) => b[1].size - a[1].size);
+      html = `<div class="cd-title">All Files by Category</div><div class="cd-grid">`;
+      html += entries.map(([cat, v]) =>
+        `<span class="cd-chip">${cat} <span class="cd-chip-val">${v.count.toLocaleString()} · ${fmt(v.size)}</span></span>`
+      ).join('');
+      html += `</div>`;
+      if (d.top_consumers && d.top_consumers.length) {
+        html += `<div class="cd-title" style="margin-top:10px">Largest Files</div>`;
+        html += d.top_consumers.slice(0,5).map(f =>
+          `<div style="font-size:11px;color:var(--muted);padding:2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${f.path}">&#128196; ${f.path.split('\\').pop()} <span style="color:var(--accent);font-weight:700">${fmt(f.size)}</span></div>`
+        ).join('');
+      }
+    } else if (cardId === 'reclaim') {
+      const safe = get('SAFE'), low = get('LOW'), med = get('MEDIUM');
+      html = `<div class="cd-title">Reclaimable Space Breakdown</div>
+        <div class="cd-grid">
+          <span class="cd-chip" style="border-color:var(--safe)">SAFE <span class="cd-chip-val" style="color:var(--safe)">${safe.count.toLocaleString()} files · ${fmt(safe.size)}</span></span>
+          <span class="cd-chip" style="border-color:var(--low)">LOW <span class="cd-chip-val" style="color:var(--low)">${low.count.toLocaleString()} files · ${fmt(low.size)}</span></span>
+          <span class="cd-chip" style="border-color:var(--medium);opacity:.7">MEDIUM <span class="cd-chip-val" style="color:var(--medium)">${med.count.toLocaleString()} files · ${fmt(med.size)}</span></span>
+        </div>
+        <div class="cd-actions">
+          <button class="reclaim-btn" onclick="App.initReclaim(['SAFE'])">Clean SAFE Files (${fmt(safe.size)})</button>
+          <button class="reclaim-btn" style="background:var(--low)" onclick="App.initReclaim(['SAFE','LOW'])">Clean SAFE + LOW (${fmt(safe.size + low.size)})</button>
+        </div>
+        <p class="cd-note">MEDIUM-risk AppData and HIGH-risk files are excluded — may affect system/app behaviour.</p>`;
+    } else if (cardId === 'SAFE') {
+      const tier = get('SAFE');
+      html = `<div class="cd-title">Safe to Delete — ${tier.count.toLocaleString()} files · ${fmt(tier.size)}</div>
+        <p class="cd-desc">Temp files, browser caches, application logs, crash dumps. These are auto-regenerated by applications — deleting is safe.</p>
+        <div class="cd-actions"><button class="reclaim-btn" onclick="App.initReclaim(['SAFE'])">Reclaim All SAFE Files (${fmt(tier.size)})</button></div>`;
+    } else if (cardId === 'LOW') {
+      const tier = get('LOW');
+      html = `<div class="cd-title">Low Risk — ${tier.count.toLocaleString()} files · ${fmt(tier.size)}</div>
+        <p class="cd-desc">Old installers in Downloads, backup files (.bak, .old), large files not accessed in 90+ days. Review before deleting.</p>
+        <div class="cd-actions"><button class="reclaim-btn" style="background:var(--low)" onclick="App.initReclaim(['LOW'])">Reclaim LOW Risk Files (${fmt(tier.size)})</button></div>`;
+    } else if (cardId === 'MEDIUM') {
+      const tier = get('MEDIUM');
+      html = `<div class="cd-title">Medium Risk — ${tier.count.toLocaleString()} files · ${fmt(tier.size)}</div>
+        <p class="cd-desc">Application settings in AppData (Roaming &amp; Local). Deleting may affect app behaviour, preferences, or saved data.</p>
+        <p class="cd-warn" style="color:var(--medium)">&#9888; Review individually in the table. Not included in bulk reclaim.</p>`;
+    } else if (cardId === 'HIGH') {
+      const tier = get('HIGH');
+      html = `<div class="cd-title">High Risk — ${tier.count.toLocaleString()} files</div>
+        <p class="cd-desc">Unknown file types or files that don't match any safe pattern. Deletion is blocked.</p>
+        <p class="cd-warn" style="color:var(--high)">&#9940; These files cannot be deleted through this tool. If needed, review manually in File Explorer.</p>`;
+    }
+
+    el.innerHTML = html;
+    el.style.display = html ? 'block' : 'none';
+  }
+
+  // ---- Reclaim All ----
+  async function initReclaim(risks) {
+    try {
+      const r = await fetch('/api/reclaim/preview');
+      const d = await r.json();
+      if (d.error) { toast(d.error, 'error'); return; }
+      const tiers = d.tiers || {};
+      const count = risks.reduce((s, risk) => s + (tiers[risk]?.count || 0), 0);
+      const size  = risks.reduce((s, risk) => s + (tiers[risk]?.size  || 0), 0);
+      if (!count) { toast('No files found for these risk levels', 'success'); return; }
+
+      state.modalType  = 'reclaim';
+      state.modalRisks = risks;
+      state.modalIds   = [];
+
+      document.getElementById('modal-title').textContent = 'Reclaim Disk Space';
+      document.getElementById('modal-desc').textContent =
+        `${count.toLocaleString()} files (${fmt(size)}) will be moved to the Windows Recycle Bin.\n` +
+        `Risk levels: ${risks.join(', ')}. You can restore them from the Recycle Bin if needed.`;
+      document.getElementById('modal-permanent').style.display = 'none';
+      document.getElementById('modal-ok-btn').textContent = 'Move to Recycle Bin';
+      document.getElementById('modal-ok-btn').disabled = false;
+      document.getElementById('modal-overlay').classList.add('show');
+    } catch (e) { toast('Could not load preview', 'error'); }
+  }
+
+  let _reclaimPoller = null;
+
+  async function executeReclaim(risks) {
+    try {
+      const r = await fetch('/api/reclaim', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ risks }),
+      });
+      const d = await r.json();
+      if (d.error && d.status !== 'running') { toast(d.error, 'error'); return; }
+      if (d.status === 'running' && d.already_running) {
+        toast('Reclaim already in progress — check progress bar below', 'info');
+      }
+      setReclaimRunning(true);
+      startReclaimPoller();
+    } catch (e) { toast('Reclaim failed: ' + e.message, 'error'); }
+  }
+
+  function setReclaimRunning(running) {
+    ['reclaim-safe-btn','reclaim-low-btn'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) { el.disabled = running; el.style.opacity = running ? '.45' : '1'; }
+    });
+    const st = document.getElementById('reclaim-status');
+    if (st && !running) st.textContent = '';
+  }
+
+  function startReclaimPoller() {
+    if (_reclaimPoller) clearInterval(_reclaimPoller);
+    _reclaimPoller = setInterval(async () => {
+      try {
+        const r = await fetch('/api/reclaim/status');
+        const d = await r.json();
+        const st = document.getElementById('reclaim-status');
+        if (d.status === 'running') {
+          const total = d.total || 0;
+          const done  = d.succeeded || 0;
+          if (st) st.textContent = total > 0
+            ? `Processing… ${done.toLocaleString()} / ${total.toLocaleString()} (${Math.round(done/total*100)}%)`
+            : 'Starting…';
+        } else {
+          clearInterval(_reclaimPoller); _reclaimPoller = null;
+          setReclaimRunning(false);
+          if (d.status === 'complete') {
+            const n = d.succeeded || 0;
+            toast(n > 0 ? `${n.toLocaleString()} files moved to Recycle Bin` : 'Nothing to reclaim');
+            await loadSummary();
+            await loadResults();
+            if (state.expandedCard) renderCardDetail(state.expandedCard);
+          } else if (d.status === 'error') {
+            toast(d.error || 'Reclaim failed', 'error');
+          }
+        }
+      } catch (e) {
+        clearInterval(_reclaimPoller); _reclaimPoller = null;
+        setReclaimRunning(false);
+      }
+    }, 2000);
+  }
+
+  // ---- Stat card interactions ----
+  function cardFilter(risk) {
+    // Toggle: clicking the active card clears the filter
+    const newRisk = state.riskFilter === risk ? '' : risk;
+    state.riskFilter = newRisk;
+    state.page = 0;
+    state.selected.clear();
+    updateSelCount();
+    // Sync risk pills UI
+    document.querySelectorAll('.risk-pill').forEach(p => p.classList.remove('active'));
+    if (newRisk) {
+      const map = { SAFE:'rp-safe', LOW:'rp-low', MEDIUM:'rp-medium', HIGH:'rp-high' };
+      document.querySelector('.' + map[newRisk])?.classList.add('active');
+    }
+    // Highlight active card
+    const cardMap = { '':'sc-total', SAFE:'sc-safe', LOW:'sc-low', MEDIUM:'sc-medium', HIGH:'sc-high' };
+    document.querySelectorAll('.stat-card').forEach(c => c.classList.remove('active'));
+    if (newRisk !== '') document.getElementById(cardMap[newRisk])?.classList.add('active');
+    loadResults();
+  }
+
+  function cardSortSize() {
+    state.sortCol = 'size';
+    state.sortDir = 'desc';
+    state.page = 0;
+    document.querySelectorAll('.stat-card').forEach(c => c.classList.remove('active'));
+    document.getElementById('sc-reclaim')?.classList.add('active');
+    loadResults();
+  }
+
+  // Close modal on overlay click
+  document.getElementById('modal-overlay').addEventListener('click', function(e) {
+    if (e.target === this) App.closeModal();
+  });
+
+  window.addEventListener('DOMContentLoaded', init);
+
+  return {
+    state, startScan, stopScan, switchTab, sortBy, onSearch, toggleRisk, toggleType,
+    filterByDrive, cardFilter, cardSortSize, cardClick,
+    rowClick, toggleSelect, selectAll, selectBySafe, paginate,
+    bulkDelete, bulkRestoreTrash,
+    openDeleteModal, closeModal, confirmDelete, onPermInput,
+    restoreFile, removeFromList,
+    loadResults, loadSummary,
+    initReclaim, executeReclaim,
+  };
+})();
+</script>
+</body>
+</html>
