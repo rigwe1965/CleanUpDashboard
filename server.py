@@ -155,28 +155,66 @@ def init_db():
 def _invalidate_summary_cache():
     """Call after any write that changes summary data."""
     with STATE._summary_cache_lock:
+        STATE._summary_cache = {}
         STATE._summary_cache_ts = 0.0
 
 
-def db_summary() -> dict:
-    # Return cached result if fresh (10-second TTL).
-    # The GROUP BY queries take ~800ms on warm cache, so a 2s TTL was too tight —
-    # the prewarm result would expire before the first browser request arrived.
+def _refresh_summary_bg() -> None:
+    try:
+        _compute_summary()
+    except Exception:
+        pass
+
+
+def _adjust_summary(rows, to_trash: bool) -> None:
+    """Apply a delete's effect to the cached summary so the UI updates instantly instead of
+    waiting for a full re-aggregation of the files table; a background refresh then confirms it."""
     with STATE._summary_cache_lock:
-        if STATE._summary_cache and (time.monotonic() - STATE._summary_cache_ts) < 10.0:
+        c = STATE._summary_cache
+        if not c or "error" in c:
+            STATE._summary_cache_ts = 0.0
+            return
+        for r in rows:
+            size = r["size"] or 0
+            for key, name in (("by_risk", r["risk"]), ("by_category", r["category"])):
+                e = c.get(key, {}).get(name)
+                if e:
+                    e["count"] = max(0, e["count"] - 1)
+                    e["size"] = max(0, e["size"] - size)
+            t = r["type"]
+            if t in c.get("by_type", {}):
+                c["by_type"][t] = max(0, c["by_type"][t] - 1)
+            if r["risk"] in ("SAFE", "LOW", "MEDIUM"):
+                c["reclaimable"] = max(0, c.get("reclaimable", 0) - size)
+            if size >= LARGE_FILE_MIN:
+                c["large_count"] = max(0, c.get("large_count", 0) - 1)
+        c["cache_count"] = c.get("by_category", {}).get("Cache & Junk", {}).get("count", 0)
+        c["dup_count"] = c.get("by_category", {}).get("Duplicates", {}).get("count", 0)
+        gone = {r["path"] for r in rows}
+        c["top_consumers"] = [t for t in c.get("top_consumers", []) if t["path"] not in gone]
+        if to_trash:
+            c["trash_count"] = c.get("trash_count", 0) + len(rows)
+        STATE._summary_cache_ts = time.monotonic()
+    threading.Thread(target=_refresh_summary_bg, daemon=True).start()
+
+
+def db_summary() -> dict:
+    # Stale-while-revalidate: a cached summary is always returned at once; when it is older
+    # than the TTL a background thread refreshes it (the aggregation takes ~1.5s on 1M rows).
+    with STATE._summary_cache_lock:
+        if STATE._summary_cache:
+            age = time.monotonic() - STATE._summary_cache_ts
+            if STATE._summary_cache_ts != -1.0 and (age >= 10.0 or STATE._summary_cache_ts == 0.0):
+                STATE._summary_cache_ts = -1.0
+                threading.Thread(target=_refresh_summary_bg, daemon=True).start()
             return dict(STATE._summary_cache)
-        # Mark cache as being refreshed so concurrent requests return stale data
-        # instead of all piling into DB queries at once.
         refreshing = STATE._summary_cache_ts == -1.0
         if not refreshing:
-            STATE._summary_cache_ts = -1.0  # sentinel: refresh in progress
+            STATE._summary_cache_ts = -1.0
+    return _compute_summary()
 
-    if refreshing:
-        # Another thread is already refreshing — return stale data if available
-        with STATE._summary_cache_lock:
-            if STATE._summary_cache:
-                return dict(STATE._summary_cache)
 
+def _compute_summary() -> dict:
     try:
         conn = get_db()
         # Totals by risk
@@ -411,7 +449,7 @@ def _sync_trashed(conn, paths: list, meta: dict) -> None:
 def _run_reclaim_bg(risks: list) -> None:
     """Recycle SAFE/LOW files in batches. rc.recycle_files decides each file's outcome
     from what is actually on disk, so a partly-successful batch is never miscounted."""
-    BATCH_SIZE = 25
+    BATCH_SIZE = 100
     DB_SYNC_INTERVAL = 50
     try:
         conn = get_db()
@@ -817,7 +855,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 part = ids[i:i + 500]
                 ph = ",".join("?" * len(part))
                 rows += conn.execute(
-                    f"SELECT id,path,size,risk FROM files WHERE in_trash=0 AND id IN ({ph})", part
+                    f"SELECT id,path,size,risk,category,type FROM files WHERE in_trash=0 AND id IN ({ph})", part
                 ).fetchall()
             conn.close()
         except Exception as e:
@@ -854,7 +892,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 db_error = str(e)
                 failed.append({"path": "list update", "reason": f"Files were processed but the list could not be updated: {e}"})
 
-        _invalidate_summary_cache()
+        done = set(succeeded)
+        _adjust_summary([r for r in rows if r["path"] in done], to_trash=not permanent)
         self._json({
             "ok": len(failed) == 0,
             "succeeded": succeeded,

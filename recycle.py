@@ -54,7 +54,7 @@ _SHFILEOPSTRUCT_ERRORS = {
 }
 
 MAX_SHELL_PATH = 259   # SHFileOperationW cannot handle longer paths
-RECYCLE_BATCH = 25
+RECYCLE_BATCH = 100
 
 
 def _recycle_paths_windows(paths: list[str]) -> tuple[bool, str]:
