@@ -1206,6 +1206,7 @@ const App = (() => {
           if (st) st.textContent = total > 0
             ? `Processing… ${done.toLocaleString()} / ${total.toLocaleString()} (${Math.round(done/total*100)}%)`
             : 'Starting…';
+          loadSummary();   // keep the Trash count and stat cards moving while the job runs
         } else {
           clearInterval(_reclaimPoller); _reclaimPoller = null;
           setReclaimRunning(false);

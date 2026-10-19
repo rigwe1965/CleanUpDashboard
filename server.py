@@ -198,7 +198,27 @@ def _adjust_summary(rows, to_trash: bool) -> None:
     threading.Thread(target=_refresh_summary_bg, daemon=True).start()
 
 
+def _live_trash_count() -> int:
+    """Cheap and always current — kept out of the cached summary so the Trash count never lags."""
+    conn = get_db()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM trash_log WHERE restored=0 AND method='recycle'").fetchone()[0]
+    finally:
+        conn.close()
+
+
 def db_summary() -> dict:
+    result = _cached_summary()
+    if "error" not in result:
+        try:
+            result["trash_count"] = _live_trash_count()
+        except Exception:
+            pass
+    return result
+
+
+def _cached_summary() -> dict:
     # Stale-while-revalidate: a cached summary is always returned at once; when it is older
     # than the TTL a background thread refreshes it (the aggregation takes ~1.5s on 1M rows).
     with STATE._summary_cache_lock:
