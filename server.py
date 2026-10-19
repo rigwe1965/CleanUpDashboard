@@ -449,6 +449,33 @@ def _progress_dispatcher():
 # ---------------------------------------------------------------------------
 # Background reclaim job
 # ---------------------------------------------------------------------------
+def _files_filter(tab: str, risk: str, type_filter: str, drive: str, q: str) -> tuple[str, list]:
+    """WHERE clause for the active-files list; shared by the results view and bulk delete,
+    so "delete all" always acts on exactly what the list shows."""
+    where_parts = ["in_trash=0", "protected=0"]
+    params: list = []
+    if tab == "cache":
+        where_parts.append("category='Cache & Junk'")
+    elif tab == "duplicates":
+        where_parts.append("is_duplicate=1")
+    elif tab == "large":
+        where_parts.append("size >= ?")
+        params.append(LARGE_FILE_MIN)
+    if risk and risk.upper() in ("SAFE", "LOW", "MEDIUM", "HIGH"):
+        where_parts.append("risk=?")
+        params.append(risk.upper())
+    if type_filter:
+        where_parts.append("type=?")
+        params.append(type_filter.lower())
+    if drive and len(drive) == 1 and drive.isalpha():
+        where_parts.append("drive=?")
+        params.append(drive.upper())
+    if q:
+        where_parts.append("LOWER(path) LIKE ?")
+        params.append(f"%{q.lower()}%")
+    return " AND ".join(where_parts), params
+
+
 def _sync_trashed(conn, paths: list, meta: dict) -> None:
     """Mark paths as trashed in the files table and log them in trash_log."""
     now_ts = datetime.now(timezone.utc).isoformat()
@@ -466,17 +493,16 @@ def _sync_trashed(conn, paths: list, meta: dict) -> None:
     conn.commit()
 
 
-def _run_reclaim_bg(risks: list) -> None:
-    """Recycle SAFE/LOW files in batches. rc.recycle_files decides each file's outcome
-    from what is actually on disk, so a partly-successful batch is never miscounted."""
-    BATCH_SIZE = 100
+def _run_bulk_bg(where_sql: str, params: list, permanent: bool) -> None:
+    """Delete every active file matching the filter, in chunks, with live progress.
+    Each chunk is safety-checked and its real on-disk outcome decides success, so a
+    partly-failed chunk is never miscounted. Runs behind /api/reclaim/status."""
+    CHUNK = 500 if permanent else 100
     DB_SYNC_INTERVAL = 50
     try:
         conn = get_db()
-        ph = ",".join("?" * len(risks))
         rows = conn.execute(
-            f"SELECT id,path,size,risk FROM files WHERE in_trash=0 AND protected=0 AND risk IN ({ph})",
-            risks,
+            f"SELECT id,path,size,risk FROM files WHERE {where_sql} ORDER BY size DESC", params
         ).fetchall()
     except Exception as e:
         with STATE.reclaim_job_lock:
@@ -484,48 +510,72 @@ def _run_reclaim_bg(risks: list) -> None:
         return
 
     meta = {r["path"]: (r["id"], r["size"], r["risk"]) for r in rows}
-    all_paths = [r["path"] for r in rows if os.path.isfile(r["path"]) and rc._safety_check(r["path"])[0]]
+    all_paths = [r["path"] for r in rows]
     with STATE.reclaim_job_lock:
         STATE.reclaim_job["total"] = len(all_paths)
 
-    succeeded: list[str] = []
+    succeeded_n = 0
     failed_count = 0
-    db_synced = 0
+    freed = 0
+    pending: list[str] = []      # recycled but not yet written to the db
     db_error = ""
 
-    for i in range(0, len(all_paths), BATCH_SIZE):
-        chunk = all_paths[i:i + BATCH_SIZE]
-        ok_paths, fail_paths = rc.recycle_files(chunk)
-        succeeded.extend(ok_paths)
-        failed_count += len(fail_paths)
-
-        if len(succeeded) - db_synced >= DB_SYNC_INTERVAL:
-            try:
-                _sync_trashed(conn, succeeded[db_synced:], meta)
-                db_synced = len(succeeded)
-            except Exception as e:
-                db_error = str(e)
-
-        with STATE.reclaim_job_lock:
-            STATE.reclaim_job["succeeded"] = len(succeeded)
-            STATE.reclaim_job["failed_count"] = failed_count
-
-    if len(succeeded) > db_synced:
+    def flush(paths: list[str]) -> None:
+        nonlocal db_error
+        if not paths:
+            return
         try:
-            _sync_trashed(conn, succeeded[db_synced:], meta)
+            if permanent:
+                conn.executemany("DELETE FROM files WHERE path=?", [(p,) for p in paths])
+                conn.commit()
+            else:
+                _sync_trashed(conn, paths, meta)
         except Exception as e:
             db_error = str(e)
 
+    for i in range(0, len(all_paths), CHUNK):
+        chunk = all_paths[i:i + CHUNK]
+        try:
+            if permanent:
+                res = rc.permanently_delete(chunk, DB_PATH)
+                ok_paths = res["succeeded"]
+                freed += res.get("bytes_freed", 0)
+                failed_count += len(res["failed"])
+                flush(ok_paths)
+            else:
+                res = rc.send_to_recycle_bin(chunk, "", meta)
+                ok_paths = res["succeeded"]
+                failed_count += len(res["failed"])
+                pending.extend(ok_paths)
+                if len(pending) >= DB_SYNC_INTERVAL:
+                    flush(pending)
+                    pending = []
+        except Exception:
+            failed_count += len(chunk)
+            ok_paths = []
+        succeeded_n += len(ok_paths)
+        with STATE.reclaim_job_lock:
+            STATE.reclaim_job["succeeded"] = succeeded_n
+            STATE.reclaim_job["failed_count"] = failed_count
+
+    flush(pending)
     conn.close()
     _invalidate_summary_cache()
     with STATE.reclaim_job_lock:
         STATE.reclaim_job.update({
             "status": "complete",
-            "succeeded": len(succeeded),
+            "succeeded": succeeded_n,
             "failed_count": failed_count,
+            "bytes_freed": freed,
+            "permanent": permanent,
         })
         if db_error:
-            STATE.reclaim_job["error"] = f"Files were moved but the list could not be updated: {db_error}"
+            STATE.reclaim_job["error"] = f"Files were processed but the list could not be updated: {db_error}"
+
+
+def _run_reclaim_bg(risks: list) -> None:
+    ph = ",".join("?" * len(risks))
+    _run_bulk_bg(f"in_trash=0 AND protected=0 AND risk IN ({ph})", list(risks), False)
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +668,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_trash_remove()
         elif path == "/api/trash/clear":
             self._handle_trash_clear()
+        elif path == "/api/delete/filtered":
+            self._handle_delete_filtered()
         elif path == "/api/reclaim":
             self._handle_reclaim()
         else:
@@ -787,36 +839,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._handle_trash_results(qs, sort, direction, page)
                 return
             conn = get_db()
-            where_parts = ["in_trash=0", "protected=0"]
-            params: list = []
-
-            if tab == "cache":
-                where_parts.append("category='Cache & Junk'")
-            elif tab == "duplicates":
-                where_parts.append("is_duplicate=1")
-            elif tab == "large":
-                where_parts.append("size >= ?")
-                params.append(LARGE_FILE_MIN)
-
-            if risk and risk.upper() in ("SAFE", "LOW", "MEDIUM", "HIGH"):
-                where_parts.append("risk=?")
-                params.append(risk.upper())
-
-            type_filter = qs.get("type", "")
-            if type_filter:
-                where_parts.append("type=?")
-                params.append(type_filter.lower())
-
-            drive = qs.get("drive", "")
-            if drive and len(drive) == 1 and drive.isalpha():
-                where_parts.append("drive=?")
-                params.append(drive.upper())
-
-            if q:
-                where_parts.append("LOWER(path) LIKE ?")
-                params.append(f"%{q.lower()}%")
-
-            where_sql = " AND ".join(where_parts)
+            where_sql, params = _files_filter(tab, risk, qs.get("type", ""), qs.get("drive", ""), q)
             offset = page * PAGE_SIZE
 
             total = conn.execute(f"SELECT COUNT(*) FROM files WHERE {where_sql}", list(params)).fetchone()[0]
@@ -988,6 +1011,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
             STATE.reclaim_job = {"status": "running", "succeeded": 0, "total": 0, "failed_count": 0}
 
         threading.Thread(target=_run_reclaim_bg, args=(risks,), daemon=True).start()
+        self._json({"ok": True, "status": "running"})
+
+    def _handle_delete_filtered(self):
+        """Delete everything matching the current list filters as one background job."""
+        body = self._read_body()
+        permanent = body.get("permanent") is True
+        tab = body.get("tab", "all")
+        if tab == "trash":
+            self._json({"error": "Use Empty Trash for the Trash tab"}, 400)
+            return
+        where_sql, params = _files_filter(tab, str(body.get("risk", "")), str(body.get("type", "")),
+                                          str(body.get("drive", "")), str(body.get("q", "")))
+        with STATE.reclaim_job_lock:
+            if STATE.reclaim_job.get("status") == "running":
+                self._json({"error": "A bulk delete is already running", "status": "running", "already_running": True}, 409)
+                return
+            STATE.reclaim_job = {"status": "running", "succeeded": 0, "total": 0, "failed_count": 0,
+                                 "permanent": permanent}
+        threading.Thread(target=_run_bulk_bg, args=(where_sql, params, permanent), daemon=True).start()
         self._json({"ok": True, "status": "running"})
 
     def _handle_reclaim_status(self):

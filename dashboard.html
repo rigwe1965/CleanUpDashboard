@@ -95,6 +95,10 @@ header h1 { font-size: 18px; font-weight: 700; color: var(--text); flex: 1; }
 #bulk-del-btn:hover { opacity: .85; }
 #bulk-perm-btn { padding: 6px 14px; border: 1px solid var(--high); border-radius: var(--radius); background: transparent; color: var(--high); font-size: 12px; font-weight: 600; cursor: pointer; display: none; white-space: nowrap; }
 #bulk-perm-btn:hover { background: #fee2e2; }
+#bulk-all-btn, #bulk-all-perm-btn { padding: 6px 14px; border-radius: var(--radius); font-size: 12px; font-weight: 600; cursor: pointer; display: none; white-space: nowrap; }
+#bulk-all-btn { border: none; background: var(--high); color: #fff; }
+#bulk-all-perm-btn { border: 1px solid var(--high); background: transparent; color: var(--high); }
+#bulk-all-btn:disabled, #bulk-all-perm-btn:disabled { opacity: .45; cursor: not-allowed; }
 #bulk-restore-btn { padding: 6px 14px; border: 1px solid var(--low); border-radius: var(--radius); background: transparent; color: var(--low); font-size: 12px; font-weight: 600; cursor: pointer; display: none; white-space: nowrap; }
 #bulk-restore-btn:hover { background: #dbeafe; }
 
@@ -262,6 +266,8 @@ tr.data-row.range-hover td { background: #dcf0e688; }
   <button id="bulk-restore-btn" onclick="App.bulkRestoreTrash()">Restore Selected</button>
   <button id="bulk-del-btn"     onclick="App.bulkDelete()">Delete Selected</button>
   <button id="bulk-perm-btn"    onclick="App.bulkDeletePermanent()" title="Delete right away, skipping the Recycle Bin">Delete Permanently</button>
+  <button id="bulk-all-btn"     onclick="App.deleteAllFiltered(false)" title="Move every file matching the current filters to the Recycle Bin">Delete all</button>
+  <button id="bulk-all-perm-btn" onclick="App.deleteAllFiltered(true)" title="Permanently delete every file matching the current filters">Delete all permanently</button>
   <button id="empty-trash-btn"  onclick="App.emptyTrash()" style="display:none;padding:6px 14px;border:none;border-radius:var(--radius);background:#dc2626;color:#fff;font-size:12px;font-weight:600;cursor:pointer">Empty Trash</button>
 </div>
 
@@ -401,6 +407,11 @@ const App = (() => {
     document.getElementById('bulk-del-btn').textContent = isTrash ? 'Delete Permanently' : 'Delete Selected';
     document.getElementById('bulk-perm-btn').style.display = (n > 0 && !isTrash) ? 'inline-block' : 'none';
     document.getElementById('bulk-restore-btn').style.display = (n > 0 && isTrash) ? 'inline-block' : 'none';
+    const showAll = !isTrash && state.total > 0;
+    const all = document.getElementById('bulk-all-btn'), allp = document.getElementById('bulk-all-perm-btn');
+    all.style.display = allp.style.display = showAll ? 'inline-block' : 'none';
+    all.textContent = `Delete all ${state.total.toLocaleString()}`;
+    allp.textContent = `Delete all ${state.total.toLocaleString()} permanently`;
   }
 
   function updateEmptyTrashBtn(trashCount) {
@@ -661,6 +672,7 @@ const App = (() => {
       const d = await r.json();
       if (d.error) { toast(d.error, 'error'); return; }
       state.total = d.total;
+      updateSelCount();
       state.currentRows = d.results;
       state.lastClickIdx = -1;
       renderTable(d.results);
@@ -1016,7 +1028,46 @@ const App = (() => {
     state.modalRisks = [];
   }
 
+  function deleteAllFiltered(permanent) {
+    if (!state.total || state.activeTab === 'trash') return;
+    state.modalType = 'filtered';
+    state.modalPermanent = permanent;
+    state.modalIds = [];
+    const n = state.total.toLocaleString();
+    const f = [state.activeTab !== 'all' ? state.activeTab : '', state.riskFilter, state.typeFilter, state.driveFilter,
+               state.query ? `"${state.query}"` : ''].filter(Boolean).join(', ');
+    document.getElementById('modal-title').textContent = permanent ? 'Delete All Permanently' : 'Move All to Recycle Bin';
+    document.getElementById('modal-desc').textContent = permanent
+      ? `All ${n} files in this list${f ? ` (${f})` : ''} will be deleted right away, skipping the Recycle Bin.`
+      : `All ${n} files in this list${f ? ` (${f})` : ''} will be moved to the Windows Recycle Bin. You can restore them from the Trash tab.`;
+    document.getElementById('modal-permanent').style.display = permanent ? 'block' : 'none';
+    const ok = document.getElementById('modal-ok-btn');
+    ok.textContent = permanent ? `Delete ${n} Permanently` : `Move ${n} to Recycle Bin`;
+    ok.disabled = false;
+    document.getElementById('modal-overlay').classList.add('show');
+  }
+
+  async function runFilteredDelete(permanent) {
+    const body = { tab: state.activeTab, permanent, risk: state.riskFilter || '', type: state.typeFilter || '',
+                   drive: state.driveFilter || '', q: state.query || '' };
+    try {
+      const r = await fetch('/api/delete/filtered', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      const d = await r.json();
+      if (d.error && d.status !== 'running') { toast(d.error, 'error'); return; }
+      if (d.already_running) toast('A bulk delete is already in progress', 'info');
+      state.selected.clear(); updateSelCount();
+      setReclaimRunning(true);
+      startReclaimPoller();
+    } catch (e) { toast('Bulk delete failed: ' + e.message, 'error'); }
+  }
+
   async function confirmDelete() {
+    if (state.modalType === 'filtered') {
+      const permanent = state.modalPermanent;
+      closeModal();
+      await runFilteredDelete(permanent);
+      return;
+    }
     if (state.modalType === 'reclaim') {
       const risks = state.modalRisks;
       closeModal();
@@ -1185,7 +1236,7 @@ const App = (() => {
   }
 
   function setReclaimRunning(running) {
-    ['reclaim-safe-btn','reclaim-low-btn'].forEach(id => {
+    ['reclaim-safe-btn','reclaim-low-btn','bulk-all-btn','bulk-all-perm-btn'].forEach(id => {
       const el = document.getElementById(id);
       if (el) { el.disabled = running; el.style.opacity = running ? '.45' : '1'; }
     });
@@ -1202,7 +1253,7 @@ const App = (() => {
         const st = document.getElementById('reclaim-status');
         if (d.status === 'running') {
           const total = d.total || 0;
-          const done  = d.succeeded || 0;
+          const done  = (d.succeeded || 0) + (d.failed_count || 0);
           if (st) st.textContent = total > 0
             ? `Processing… ${done.toLocaleString()} / ${total.toLocaleString()} (${Math.round(done/total*100)}%)`
             : 'Starting…';
@@ -1212,7 +1263,11 @@ const App = (() => {
           setReclaimRunning(false);
           if (d.status === 'complete') {
             const n = d.succeeded || 0;
-            toast(n > 0 ? `${n.toLocaleString()} files moved to Recycle Bin` : 'Nothing to reclaim');
+            const bad = d.failed_count || 0;
+            const verb = d.permanent ? 'permanently deleted' : 'moved to Recycle Bin';
+            toast((n > 0 ? `${n.toLocaleString()} files ${verb}` : 'Nothing to process') +
+                  (bad ? ` · ${bad.toLocaleString()} skipped (protected, in use or missing)` : '') +
+                  (d.bytes_freed ? ` · ${fmt(d.bytes_freed)} freed` : ''), bad ? 'info' : 'success');
             await loadSummary();
             await loadResults();
             if (state.expandedCard) renderCardDetail(state.expandedCard);
@@ -1268,7 +1323,7 @@ const App = (() => {
     state, startScan, stopScan, switchTab, sortBy, onSearch, toggleRisk, toggleType,
     filterByDrive, cardFilter, cardSortSize, cardClick,
     rowClick, toggleSelect, selectAll, selectBySafe, paginate,
-    bulkDelete, bulkDeletePermanent, bulkRestoreTrash,
+    bulkDelete, bulkDeletePermanent, bulkRestoreTrash, deleteAllFiltered,
     openDeleteModal, closeModal, confirmDelete,
     restoreFile, removeFromList,
     loadResults, loadSummary,
