@@ -1268,6 +1268,12 @@ const App = (() => {
             toast((n > 0 ? `${n.toLocaleString()} files ${verb}` : 'Nothing to process') +
                   (bad ? ` · ${bad.toLocaleString()} skipped (protected, in use or missing)` : '') +
                   (d.bytes_freed ? ` · ${fmt(d.bytes_freed)} freed` : ''), bad ? 'info' : 'success');
+            const lk = Object.entries(d.locked_apps || {});
+            if (lk.length) {
+              setTimeout(() => toast(`Files in use can't be deleted while open: ` +
+                lk.map(([a, c]) => `${a} (${c.toLocaleString()})`).join(', ') +
+                `. Close ${lk.length > 1 ? 'those programs' : 'it'} and run Delete all again.`, 'error'), 400);
+            }
             await loadSummary();
             await loadResults();
             if (state.expandedCard) renderCardDetail(state.expandedCard);

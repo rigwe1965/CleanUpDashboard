@@ -493,6 +493,14 @@ def _sync_trashed(conn, paths: list, meta: dict) -> None:
     conn.commit()
 
 
+def _tally_locked(failures: list, apps: dict) -> None:
+    for f in failures:
+        r = f.get("reason", "")
+        if "in use" in r.lower():
+            name = r.split("In use by ", 1)[1].split(" —")[0] if r.startswith("In use by ") else "another program"
+            apps[name] = apps.get(name, 0) + 1
+
+
 def _run_bulk_bg(where_sql: str, params: list, permanent: bool) -> None:
     """Delete every active file matching the filter, in chunks, with live progress.
     Each chunk is safety-checked and its real on-disk outcome decides success, so a
@@ -517,6 +525,7 @@ def _run_bulk_bg(where_sql: str, params: list, permanent: bool) -> None:
     succeeded_n = 0
     failed_count = 0
     freed = 0
+    locked_apps: dict[str, int] = {}     # who is holding files open -> how many
     pending: list[str] = []      # recycled but not yet written to the db
     db_error = ""
 
@@ -541,11 +550,13 @@ def _run_bulk_bg(where_sql: str, params: list, permanent: bool) -> None:
                 ok_paths = res["succeeded"]
                 freed += res.get("bytes_freed", 0)
                 failed_count += len(res["failed"])
+                _tally_locked(res["failed"], locked_apps)
                 flush(ok_paths)
             else:
                 res = rc.send_to_recycle_bin(chunk, "", meta)
                 ok_paths = res["succeeded"]
                 failed_count += len(res["failed"])
+                _tally_locked(res["failed"], locked_apps)
                 pending.extend(ok_paths)
                 if len(pending) >= DB_SYNC_INTERVAL:
                     flush(pending)
@@ -568,6 +579,7 @@ def _run_bulk_bg(where_sql: str, params: list, permanent: bool) -> None:
             "failed_count": failed_count,
             "bytes_freed": freed,
             "permanent": permanent,
+            "locked_apps": locked_apps,
         })
         if db_error:
             STATE.reclaim_job["error"] = f"Files were processed but the list could not be updated: {db_error}"

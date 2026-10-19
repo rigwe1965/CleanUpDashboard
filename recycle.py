@@ -92,6 +92,43 @@ def _recycle_paths_windows(paths: list[str]) -> tuple[bool, str]:
             ctypes.windll.ole32.CoUninitialize()
 
 
+_APP_HINTS = (
+    ("\\google\\chrome\\", "Google Chrome"), ("\\microsoft\\edge\\", "Microsoft Edge"),
+    ("\\bravesoftware\\", "Brave"), ("\\mozilla\\firefox\\", "Firefox"),
+    ("\\msteams", "Microsoft Teams"), ("\\microsoft\\teams", "Microsoft Teams"),
+    ("\\code\\", "VS Code"), ("\\slack\\", "Slack"), ("\\discord\\", "Discord"),
+    ("\\greenshot", "Greenshot"), ("\\onedrive", "OneDrive"), ("\\spotify\\", "Spotify"),
+)
+
+
+def app_hint(path: str) -> str:
+    """Best-guess name of the program that has a locked file open, from where the file lives."""
+    low = path.lower()
+    for needle, name in _APP_HINTS:
+        if needle in low:
+            return name
+    return ""
+
+
+def is_locked(path: str) -> bool:
+    """True if another program has the file open without allowing delete. Opening with DELETE
+    access and full sharing fails with a sharing violation exactly when Windows would refuse the
+    delete: ~15 us per file, so locked files are skipped up front instead of failing a batch."""
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.restype = ctypes.c_void_p
+    h = k32.CreateFileW(path, 0x10000, 7, None, 3, 0x02000000, None)   # DELETE, share all, OPEN_EXISTING
+    if h in (None, ctypes.c_void_p(-1).value):
+        return k32.GetLastError() in (32, 33)
+    k32.CloseHandle(ctypes.c_void_p(h))
+    return False
+
+
+def _locked_reason(path: str) -> str:
+    app = app_hint(path)
+    return (f"In use by {app} — close it and retry" if app
+            else "File is in use by another application — close it and retry")
+
+
 def _safety_check(path: str, stat_result=None) -> tuple[bool, str]:
     """Return (ok, reason). ok=False means refuse the delete."""
     # Resolve symlinks first — prevents symlink attacks that bypass protected-path checks.
@@ -178,6 +215,14 @@ def send_to_recycle_bin(paths: list[str], db_path: str, meta: dict | None = None
         else:
             failed.append({"path": p, "reason": reason})
 
+    unlocked = []
+    for p in safe:
+        if is_locked(p):
+            failed.append({"path": p, "reason": _locked_reason(p)})
+        else:
+            unlocked.append(p)
+    safe = unlocked
+
     sizes = {}
     for p in safe:
         try:
@@ -250,7 +295,7 @@ def permanently_delete(paths: list[str], db_path: str) -> dict:
             missing.append(p)
             continue
         except Exception as e:
-            reason = "File is in use by another application — close it and retry" \
+            reason = _locked_reason(p) \
                 if getattr(e, "winerror", None) in (32, 33) else f"Delete failed: {e}"
             failed.append({"path": p, "reason": reason})
             continue
