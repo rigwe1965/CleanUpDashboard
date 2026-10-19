@@ -93,6 +93,8 @@ header h1 { font-size: 18px; font-weight: 700; color: var(--text); flex: 1; }
 #sel-count { font-size: 12px; color: var(--accent); font-weight: 600; white-space: nowrap; }
 #bulk-del-btn { padding: 6px 14px; border: none; border-radius: var(--radius); background: var(--high); color: #fff; font-size: 12px; font-weight: 600; cursor: pointer; display: none; white-space: nowrap; }
 #bulk-del-btn:hover { opacity: .85; }
+#bulk-perm-btn { padding: 6px 14px; border: 1px solid var(--high); border-radius: var(--radius); background: transparent; color: var(--high); font-size: 12px; font-weight: 600; cursor: pointer; display: none; white-space: nowrap; }
+#bulk-perm-btn:hover { background: #fee2e2; }
 #bulk-restore-btn { padding: 6px 14px; border: 1px solid var(--low); border-radius: var(--radius); background: transparent; color: var(--low); font-size: 12px; font-weight: 600; cursor: pointer; display: none; white-space: nowrap; }
 #bulk-restore-btn:hover { background: #dbeafe; }
 
@@ -126,6 +128,7 @@ tr.data-row.selected td { background: #dcf0e6; }
 .badge-low    { background: #dbeafe; color: var(--low); }
 .badge-medium { background: #fef3c7; color: var(--medium); }
 .badge-high   { background: #fee2e2; color: var(--high); }
+.badge-unknown { background: var(--surface2); color: var(--muted); }
 
 /* ---- Pagination ---- */
 #pagination { display: flex; gap: 8px; align-items: center; justify-content: center; padding: 14px; }
@@ -156,7 +159,9 @@ tr.data-row.selected td { background: #dcf0e6; }
 #toast.error   { background: #fee2e2; color: var(--high); border: 1px solid var(--high); }
 
 /* ---- Action btns (row) ---- */
-.row-btns { display: flex; gap: 4px; }
+.row-btns { display: flex; gap: 4px; flex-wrap: wrap; }
+.row-locked { font-size: 11px; color: var(--muted); font-style: italic; cursor: help; }
+tr.locked { opacity: .6; }
 .row-act-btn { padding: 3px 9px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; }
 .row-act-btn:hover { background: var(--surface2); color: var(--text); }
 .row-restore-btn { border-color: var(--low); color: var(--low); }
@@ -256,6 +261,8 @@ tr.data-row.range-hover td { background: #dcf0e688; }
   <span id="sel-count"></span>
   <button id="bulk-restore-btn" onclick="App.bulkRestoreTrash()">Restore Selected</button>
   <button id="bulk-del-btn"     onclick="App.bulkDelete()">Delete Selected</button>
+  <button id="bulk-perm-btn"    onclick="App.bulkDeletePermanent()" title="Delete right away, skipping the Recycle Bin">Delete Permanently</button>
+  <button id="empty-trash-btn"  onclick="App.emptyTrash()" style="display:none;padding:6px 14px;border:none;border-radius:var(--radius);background:#dc2626;color:#fff;font-size:12px;font-weight:600;cursor:pointer">Empty Trash</button>
 </div>
 
 <!-- Table -->
@@ -293,8 +300,7 @@ tr.data-row.range-hover td { background: #dcf0e688; }
     <h2 id="modal-title">Confirm</h2>
     <p class="modal-sub" id="modal-desc"></p>
     <div id="modal-permanent">
-      <p>&#9888; This cannot be undone. Type <strong>DELETE</strong> to confirm:</p>
-      <input id="modal-confirm-input" type="text" placeholder="Type DELETE" oninput="App.onPermInput(this.value)">
+      <p>&#9888; This cannot be undone. The files do not go to the Recycle Bin.</p>
     </div>
     <div class="modal-btns">
       <button class="btn-cancel" onclick="App.closeModal()">Cancel</button>
@@ -336,6 +342,7 @@ const App = (() => {
   let searchTimer = null;
   let sse = null;
   let scanPoller = null;
+  let _resultsFetch = null;
 
   // ---- Helpers ----
   function fmt(bytes) {
@@ -355,8 +362,8 @@ const App = (() => {
   }
 
   function riskBadge(risk) {
-    const cls = { SAFE:'safe', LOW:'low', MEDIUM:'medium', HIGH:'high' }[risk] || 'high';
-    return `<span class="badge badge-${cls}">${risk}</span>`;
+    const cls = { SAFE:'safe', LOW:'low', MEDIUM:'medium', HIGH:'high' }[risk] || 'unknown';
+    return `<span class="badge badge-${cls}">${risk === 'UNKNOWN' ? '—' : risk}</span>`;
   }
 
   function toast(msg, type = 'success') {
@@ -391,8 +398,21 @@ const App = (() => {
     const isTrash = state.activeTab === 'trash';
     document.getElementById('sel-count').textContent = n ? `${n} selected` : '';
     document.getElementById('bulk-del-btn').style.display = n > 0 ? 'inline-block' : 'none';
-    document.getElementById('bulk-del-btn').textContent = isTrash ? 'Permanent Delete' : 'Delete Selected';
+    document.getElementById('bulk-del-btn').textContent = isTrash ? 'Delete Permanently' : 'Delete Selected';
+    document.getElementById('bulk-perm-btn').style.display = (n > 0 && !isTrash) ? 'inline-block' : 'none';
     document.getElementById('bulk-restore-btn').style.display = (n > 0 && isTrash) ? 'inline-block' : 'none';
+  }
+
+  function updateEmptyTrashBtn(trashCount) {
+    const btn = document.getElementById('empty-trash-btn');
+    if (!btn) return;
+    const isTrash = state.activeTab === 'trash';
+    if (isTrash && trashCount > 0) {
+      btn.style.display = 'inline-block';
+      btn.textContent = `Empty Trash (${trashCount.toLocaleString()})`;
+    } else {
+      btn.style.display = 'none';
+    }
   }
 
   // ---- Init ----
@@ -605,6 +625,8 @@ const App = (() => {
       barEl.style.display = 'none';
     }
 
+    updateEmptyTrashBtn(d.trash_count || 0);
+
     // Tab count badges
     const tabCounts = {
       cache:      { label: 'Cache & Junk', count: d.cache_count || 0 },
@@ -620,6 +642,9 @@ const App = (() => {
 
   // ---- Results ----
   async function loadResults() {
+    if (_resultsFetch) { _resultsFetch.abort(); _resultsFetch = null; }
+    const ctrl = new AbortController();
+    _resultsFetch = ctrl;
     const qs = new URLSearchParams({
       tab: state.activeTab,
       sort: state.sortCol,
@@ -631,14 +656,17 @@ const App = (() => {
     if (state.driveFilter) qs.set('drive', state.driveFilter);
     if (state.typeFilter) qs.set('type', state.typeFilter);
     try {
-      const r = await fetch(`/api/results?${qs}`);
+      const r = await fetch(`/api/results?${qs}`, { signal: ctrl.signal });
+      _resultsFetch = null;
       const d = await r.json();
       if (d.error) { toast(d.error, 'error'); return; }
       state.total = d.total;
       state.currentRows = d.results;
       state.lastClickIdx = -1;
       renderTable(d.results);
-    } catch (e) {}
+    } catch (e) {
+      if (e.name !== 'AbortError') toast('Failed to load results', 'error');
+    }
   }
 
   function renderTable(rows) {
@@ -679,12 +707,19 @@ const App = (() => {
             <button class="row-act-btn row-restore-btn" onclick="event.stopPropagation();App.restoreFile('${row.id}')">Restore</button>
             <button class="row-act-btn row-remove-btn"  onclick="event.stopPropagation();App.removeFromList('${row.id}')">Delete</button>
           </div>`;
+      } else if (isLocked(row)) {
+        actionBtns = `<span class="row-locked" title="HIGH risk — never deleted by this dashboard">Protected</span>`;
       } else {
-        actionBtns = `<button class="row-act-btn" onclick="event.stopPropagation();App.openDeleteModal(['${row.id}'],false)">Delete</button>`;
+        actionBtns = `
+          <div class="row-btns">
+            <button class="row-act-btn" onclick="event.stopPropagation();App.openDeleteModal(['${row.id}'],false)" title="Move to the Recycle Bin">Delete</button>
+            <button class="row-act-btn row-remove-btn" onclick="event.stopPropagation();App.openDeleteModal(['${row.id}'],true)" title="Delete right away, skipping the Recycle Bin">Delete forever</button>
+          </div>`;
       }
+      const locked = isLocked(row);
 
-      return `<tr class="data-row${selCls}" data-id="${row.id}" data-idx="${idx}" onclick="App.rowClick(event,'${row.id}',${idx})">
-        <td class="col-chk" onclick="event.stopPropagation()"><input type="checkbox" ${checked} onchange="App.toggleSelect('${row.id}',this.checked,${idx})" style="accent-color:var(--accent);cursor:pointer"></td>
+      return `<tr class="data-row${selCls}${locked ? ' locked' : ''}" data-id="${row.id}" data-idx="${idx}" onclick="App.rowClick(event,'${row.id}',${idx})">
+        <td class="col-chk" onclick="event.stopPropagation()"><input type="checkbox" ${checked} ${locked ? 'disabled title="HIGH risk — protected from deletion"' : ''} onchange="App.toggleSelect('${row.id}',this.checked,${idx})" style="accent-color:var(--accent);cursor:${locked ? 'not-allowed' : 'pointer'}"></td>
         <td class="col-path" title="${row.path}">${driveTag}${shortPath}</td>
         <td class="col-size" style="text-align:right">${fmt(row.size)}</td>
         <td class="col-risk">${riskBadge(row.risk)}</td>
@@ -716,8 +751,12 @@ const App = (() => {
     }
 
     // Sync select-all checkbox
-    const allOnPage = rows.every(r => state.selected.has(r.id));
-    document.getElementById('select-all').checked = rows.length > 0 && allOnPage;
+    syncSelectAll();
+  }
+
+  function syncSelectAll() {
+    const sel = state.currentRows.filter(r => !isLocked(r));
+    document.getElementById('select-all').checked = sel.length > 0 && sel.every(r => state.selected.has(r.id));
   }
 
   // ---- Interactions ----
@@ -727,6 +766,7 @@ const App = (() => {
     state.selected.clear();
     state.lastClickIdx = -1;
     updateSelCount();
+    updateEmptyTrashBtn(state.summaryData?.trash_count || 0);
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
     loadResults();
   }
@@ -785,6 +825,8 @@ const App = (() => {
 
   // ---- Bulk selection ----
   function rowClick(event, id, idx) {
+    const clicked = state.currentRows[idx];
+    if (clicked && isLocked(clicked)) return;
     if (event.shiftKey && state.lastClickIdx >= 0) {
       // Shift-click: select range
       const lo = Math.min(state.lastClickIdx, idx);
@@ -792,7 +834,7 @@ const App = (() => {
       const shouldCheck = !state.selected.has(id); // toggle direction based on target
       for (let i = lo; i <= hi; i++) {
         const row = state.currentRows[i];
-        if (!row) continue;
+        if (!row || isLocked(row)) continue;
         if (shouldCheck) state.selected.add(row.id);
         else state.selected.delete(row.id);
         const tr = document.querySelector(`tr[data-id="${row.id}"]`);
@@ -812,9 +854,7 @@ const App = (() => {
       state.lastClickIdx = idx;
     }
     updateSelCount();
-    // Sync select-all
-    const allOnPage = state.currentRows.every(r => state.selected.has(r.id));
-    document.getElementById('select-all').checked = state.currentRows.length > 0 && allOnPage;
+    syncSelectAll();
   }
 
   function toggleSelect(id, checked, idx) {
@@ -828,6 +868,7 @@ const App = (() => {
 
   function selectAll(checked) {
     state.currentRows.forEach(row => {
+      if (isLocked(row)) return;
       if (checked) state.selected.add(row.id);
       else state.selected.delete(row.id);
       const tr = document.querySelector(`tr[data-id="${row.id}"]`);
@@ -858,96 +899,114 @@ const App = (() => {
   }
 
   // ---- Bulk actions ----
-  async function bulkDelete() {
+  // HIGH-risk files are never touched by the dashboard, so they cannot be selected.
+  function isLocked(row) {
+    return state.activeTab !== 'trash' && row.risk === 'HIGH';
+  }
+
+  function describeFailures(failed) {
+    const reasons = [...new Set((failed || []).map(f => f.reason).filter(Boolean))];
+    return reasons.length ? ` — ${reasons[0]}${reasons.length > 1 ? ` (+${reasons.length - 1} more)` : ''}` : '';
+  }
+
+  // "Delete Selected": Recycle Bin from the file tabs; permanent removal from the Trash tab.
+  function bulkDelete() {
     const ids = [...state.selected];
     if (!ids.length) return;
-    if (state.activeTab === 'trash') {
-      try {
-        const r = await fetch('/api/trash/remove', {
-          method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ ids }),
-        });
-        const d = await r.json();
-        if (d.removed > 0 || d.ok) {
-          state.selected.clear();
-          updateSelCount();
-          const freed = d.bytes_freed ? ` · ${fmt(d.bytes_freed)} freed` : '';
-          toast(`${d.removed} file(s) permanently deleted${freed}`);
-          await loadResults();
-          await loadSummary();
-        }
-        if (d.failed && d.failed.length) {
-          toast(`${d.failed.length} file(s) could not be deleted`, 'error');
-        }
-        if (!d.ok && !d.removed) {
-          toast(d.error || 'Delete failed', 'error');
-        }
-      } catch (e) { toast('Delete failed', 'error'); }
-    } else {
-      openDeleteModal(ids, false, false);
+    openDeleteModal(ids, false, state.activeTab === 'trash');
+  }
+
+  function bulkDeletePermanent() {
+    const ids = [...state.selected];
+    if (!ids.length || state.activeTab === 'trash') return;
+    openDeleteModal(ids, true, false);
+  }
+
+  async function emptyTrash() {
+    const count = state.summaryData?.trash_count || state.total || 0;
+    if (!count) { toast('Trash is already empty'); return; }
+    if (!confirm(`Permanently delete the ${count.toLocaleString()} item(s) this dashboard moved to the Recycle Bin?\n\n` +
+                 `Anything else in your Recycle Bin is left alone. This cannot be undone.`)) return;
+    const btn = document.getElementById('empty-trash-btn');
+    btn.disabled = true;
+    btn.textContent = 'Emptying…';
+    try {
+      const r = await fetch('/api/trash/clear', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+      const d = await r.json();
+      if (d.error) { toast(d.error, 'error'); return; }
+      const failed = d.failed || [];
+      const parts = [];
+      if (d.removed) parts.push(`${d.removed.toLocaleString()} item(s) permanently deleted${d.bytes_freed ? ` · ${fmt(d.bytes_freed)} freed` : ''}`);
+      if (d.unavailable) parts.push(`${d.unavailable} on a disconnected drive removed from the list only (they stay in that drive's Recycle Bin)`);
+      if (failed.length) parts.push(`${failed.length} could not be deleted${describeFailures(failed)}`);
+      toast(parts.join(' · ') || 'Trash is already empty', failed.length ? 'error' : 'success');
+      state.selected.clear();
+      updateSelCount();
+      await Promise.all([loadResults(), loadSummary()]);
+    } catch (e) {
+      toast('Empty Trash failed: ' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      updateEmptyTrashBtn(state.summaryData?.trash_count || 0);
     }
   }
 
-  async function bulkRestoreTrash() {
-    const ids = [...state.selected];
+  async function restoreIds(ids) {
     if (!ids.length) return;
-    let done = 0;
-    for (const id of ids) {
-      try {
-        const r = await fetch('/api/trash/restore', {
-          method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({id}),
-        });
-        const d = await r.json();
-        if (d.ok) done++;
-      } catch {}
-    }
-    if (done) {
-      toast(`${done} file(s) restored`);
-      state.selected.clear();
+    try {
+      const r = await fetch('/api/trash/restore', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ ids }),
+      });
+      const d = await r.json();
+      const failed = d.failed || [];
+      const parts = [];
+      if (d.restored) parts.push(`${d.restored} file(s) restored`);
+      if (failed.length) parts.push(`${failed.length} could not be restored${describeFailures(failed)}`);
+      else if (d.error && !d.restored) parts.push(d.error);
+      toast(parts.join(' · ') || 'Nothing restored', (failed.length || !d.restored) ? 'error' : 'success');
+      ids.forEach(id => state.selected.delete(id));
       updateSelCount();
       await loadResults();
       await loadSummary();
-    }
+    } catch (e) { toast('Restore failed: ' + e.message, 'error'); }
   }
 
+  function bulkRestoreTrash() { return restoreIds([...state.selected]); }
+  function restoreFile(id) { return restoreIds([id]); }
+
   // ---- Delete Flow ----
-  // isTrashRemove = true means removing from our list (already in Recycle Bin)
+  // isTrashRemove = true: permanently delete items from the Recycle Bin (Trash tab).
   function openDeleteModal(ids, permanent, isTrashRemove = false) {
     if (!ids.length) return;
+    state.modalType = null;
     state.modalIds = ids;
     state.modalPermanent = permanent;
     state.modalIsTrashRemove = isTrashRemove;
+    const okBtn = document.getElementById('modal-ok-btn');
+    const warn = document.getElementById('modal-permanent');
 
     if (isTrashRemove) {
-      document.getElementById('modal-title').textContent = 'Permanently Delete Files';
+      document.getElementById('modal-title').textContent = 'Delete Permanently';
       document.getElementById('modal-desc').textContent =
-        `${ids.length} file(s) will be permanently deleted from the Recycle Bin. This frees the disk space and cannot be undone.`;
-      document.getElementById('modal-permanent').style.display = 'none';
-      document.getElementById('modal-ok-btn').textContent = 'Delete Forever';
-      document.getElementById('modal-ok-btn').disabled = false;
+        `${ids.length} item(s) will be permanently deleted from the Recycle Bin. This frees the disk space and cannot be undone.`;
+      warn.style.display = 'none';
+      okBtn.textContent = 'Delete Permanently';
     } else if (permanent) {
-      document.getElementById('modal-title').textContent = 'Permanently Delete Files';
+      document.getElementById('modal-title').textContent = 'Delete Permanently';
       document.getElementById('modal-desc').textContent =
-        `${ids.length} file(s) will be securely wiped and cannot be recovered.`;
-      document.getElementById('modal-permanent').style.display = 'block';
-      document.getElementById('modal-confirm-input').value = '';
-      document.getElementById('modal-ok-btn').textContent = 'Delete Permanently';
-      document.getElementById('modal-ok-btn').disabled = true;
+        `${ids.length} file(s) will be deleted right away, skipping the Recycle Bin.`;
+      warn.style.display = 'block';
+      okBtn.textContent = 'Delete Permanently';
     } else {
       document.getElementById('modal-title').textContent = 'Move to Recycle Bin';
       document.getElementById('modal-desc').textContent =
-        `${ids.length} file(s) will be moved to the Windows Recycle Bin. You can restore them from there.`;
-      document.getElementById('modal-permanent').style.display = 'none';
-      document.getElementById('modal-ok-btn').textContent = 'Move to Recycle Bin';
-      document.getElementById('modal-ok-btn').disabled = false;
+        `${ids.length} file(s) will be moved to the Windows Recycle Bin. You can restore them from the Trash tab.`;
+      warn.style.display = 'none';
+      okBtn.textContent = 'Move to Recycle Bin';
     }
-
+    okBtn.disabled = false;
     document.getElementById('modal-overlay').classList.add('show');
-  }
-
-  function onPermInput(val) {
-    document.getElementById('modal-ok-btn').disabled = val.trim() !== 'DELETE';
   }
 
   function closeModal() {
@@ -964,75 +1023,45 @@ const App = (() => {
       await executeReclaim(risks);
       return;
     }
-    const { modalIds: ids, modalPermanent: permanent, modalIsTrashRemove } = state;
+    const { modalIds: ids, modalPermanent: permanent, modalIsTrashRemove: trashRemove } = state;
     if (!ids.length) return;
-    if (permanent && document.getElementById('modal-confirm-input').value.trim() !== 'DELETE') return;
     closeModal();
 
     try {
-      const r = await fetch('/api/delete', {
+      const r = await fetch(trashRemove ? '/api/trash/remove' : '/api/delete', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ ids, permanent }),
+        body: JSON.stringify(trashRemove ? { ids } : { ids, permanent }),
       });
       const d = await r.json();
-      if (d.succeeded && d.succeeded.length) {
-        ids.forEach(id => state.selected.delete(id));
-        updateSelCount();
-        const verb = modalIsTrashRemove ? 'removed from list' : permanent ? 'permanently deleted' : 'moved to Recycle Bin';
-        toast(`${d.succeeded.length} file(s) ${verb}`);
-        await loadSummary();
-        await loadResults();
+      if (d.error) { toast(d.error, 'error'); return; }
+
+      const done = trashRemove ? (d.removed || 0) : (d.succeeded || []).length;
+      const offline = d.unavailable || 0;
+      const gone = (d.missing || []).length;
+      const failed = d.failed || [];
+      const verb = (trashRemove || permanent) ? 'permanently deleted' : 'moved to Recycle Bin';
+      const parts = [];
+      if (done) {
+        let m = `${done} file(s) ${verb}`;
+        if (gone) m += ` (${gone} already gone)`;
+        if (d.bytes_freed) m += ` · ${fmt(d.bytes_freed)} freed`;
+        parts.push(m);
       }
-      if (d.failed && d.failed.length) {
-        const reasons = [...new Set(d.failed.map(f => f.reason).filter(Boolean))];
-        const detail = reasons.length ? ` — ${reasons[0]}${reasons.length > 1 ? ` (+${reasons.length - 1} more)` : ''}` : '';
-        toast(`${d.failed.length} file(s) could not be processed${detail}`, 'error');
-      }
-      if (!d.succeeded?.length && !d.failed?.length) {
-        toast(d.error || 'No files were processed', 'error');
-      }
+      if (offline) parts.push(`${offline} on a disconnected drive removed from the list only`);
+      if (failed.length) parts.push(`${failed.length} could not be processed${describeFailures(failed)}`);
+      toast(parts.join(' · ') || 'No files were processed', failed.length ? 'error' : 'success');
+
+      state.selected.clear();   // failures stay listed, unselected
+      updateSelCount();
+      await loadSummary();
+      await loadResults();
     } catch (e) {
       toast('Action failed: ' + e.message, 'error');
     }
   }
 
-  async function restoreFile(id) {
-    try {
-      const r = await fetch('/api/trash/restore', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({id}),
-      });
-      const d = await r.json();
-      if (d.ok) {
-        toast('File restored');
-        await loadResults();
-        await loadSummary();
-      } else {
-        toast(d.error || 'Restore failed', 'error');
-      }
-    } catch (e) { toast('Restore failed', 'error'); }
-  }
-
-  async function removeFromList(id) {
-    try {
-      const r = await fetch('/api/trash/remove', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ ids: [id] }),
-      });
-      const d = await r.json();
-      if (d.removed > 0 || d.ok) {
-        state.selected.delete(id);
-        updateSelCount();
-        const freed = d.bytes_freed ? ` · ${fmt(d.bytes_freed)} freed` : '';
-        toast(`Permanently deleted${freed}`);
-        await loadResults();
-        await loadSummary();
-      } else {
-        toast(d.error || 'Remove failed', 'error');
-      }
-    } catch (e) { toast('Remove failed', 'error'); }
-  }
+  function removeFromList(id) { openDeleteModal([id], false, true); }
 
   // ---- Card click: filter + expand detail panel ----
   function cardClick(cardId) {
@@ -1238,11 +1267,12 @@ const App = (() => {
     state, startScan, stopScan, switchTab, sortBy, onSearch, toggleRisk, toggleType,
     filterByDrive, cardFilter, cardSortSize, cardClick,
     rowClick, toggleSelect, selectAll, selectBySafe, paginate,
-    bulkDelete, bulkRestoreTrash,
-    openDeleteModal, closeModal, confirmDelete, onPermInput,
+    bulkDelete, bulkDeletePermanent, bulkRestoreTrash,
+    openDeleteModal, closeModal, confirmDelete,
     restoreFile, removeFromList,
     loadResults, loadSummary,
     initReclaim, executeReclaim,
+    emptyTrash,
   };
 })();
 </script>

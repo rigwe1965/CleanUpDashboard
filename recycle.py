@@ -9,12 +9,16 @@ Never called automatically — only via POST /api/delete.
 import ctypes
 import ctypes.wintypes
 import os
+import shutil
 import sqlite3
+import stat
 import struct
+import subprocess
 import uuid
 from datetime import datetime, timezone
+from typing import NamedTuple
 
-from classifier import is_protected, classify
+from classifier import is_protected, classify, has_system_attribute
 
 # ---------------------------------------------------------------------------
 # SHFILEOPSTRUCT constants
@@ -37,6 +41,20 @@ class _SHFILEOPSTRUCTW(ctypes.Structure):
         ("hNameMappings", ctypes.c_void_p),
         ("lpszProgressTitle", ctypes.c_wchar_p),
     ]
+
+
+_SHFILEOPSTRUCT_ERRORS = {
+    2:   "File not found",
+    5:   "Access denied",
+    32:  "File is in use by another application — close that app and retry",
+    112: "Disk full",
+    123: "Invalid file name",
+    124: "File path invalid or inaccessible",
+    1026: "Windows could not move the file to the Recycle Bin (in use, or path too long)",
+}
+
+MAX_SHELL_PATH = 259   # SHFileOperationW cannot handle longer paths
+RECYCLE_BATCH = 25
 
 
 def _recycle_paths_windows(paths: list[str]) -> tuple[bool, str]:
@@ -63,7 +81,8 @@ def _recycle_paths_windows(paths: list[str]) -> tuple[bool, str]:
 
         ret = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
         if ret != 0:
-            return False, f"SHFileOperationW returned error code {ret}"
+            msg = _SHFILEOPSTRUCT_ERRORS.get(ret, f"Windows error {ret}")
+            return False, msg
         if op.fAnyOperationsAborted:
             return False, "Operation was aborted by the user"
         return True, ""
@@ -75,242 +94,401 @@ def _recycle_paths_windows(paths: list[str]) -> tuple[bool, str]:
 
 def _safety_check(path: str, stat_result=None) -> tuple[bool, str]:
     """Return (ok, reason). ok=False means refuse the delete."""
-    if not os.path.exists(path):
+    # Resolve symlinks first — prevents symlink attacks that bypass protected-path checks.
+    real = os.path.realpath(path)
+    if not os.path.exists(real):
         return False, f"File not found: {path}"
-    if not os.path.isfile(path):
+    if not os.path.isfile(real):
         return False, f"Not a file (directories are not allowed): {path}"
-    if is_protected(path):
-        return False, f"Path is in a protected system directory: {path}"
-    # Re-classify at delete time
+    if is_protected(real) or is_protected(path):
+        return False, f"Protected system data — never deleted: {path}"
+    if "\\$recycle.bin\\" in real.lower():
+        return False, f"Inside the Recycle Bin — manage it from the Trash tab: {path}"
+    # Re-classify at delete time using the resolved real path. Fail closed: if the file
+    # cannot be inspected it is not deleted.
     try:
-        s = stat_result or os.stat(path)
-        result = classify(path, s.st_size, s)
-        if result["risk"] == "HIGH" and not path.lower().endswith(".log"):
-            return False, f"Re-classification returned HIGH risk — delete refused: {path}"
-    except Exception:
-        pass
+        s = stat_result or os.stat(real)
+        if has_system_attribute(s):
+            return False, f"Windows system file (SYSTEM attribute) — never deleted: {path}"
+        result = classify(real, s.st_size, s)
+    except Exception as e:
+        return False, f"Could not verify the file is safe to delete ({e}): {path}"
+    if result.get("protected"):
+        return False, f"Protected system data — never deleted: {path}"
+    if result["risk"] == "HIGH" and not real.lower().endswith(".log"):
+        return False, f"HIGH risk file — not touched: {path}"
     return True, ""
 
 
-def send_to_recycle_bin(paths: list[str], db_path: str) -> dict:
+def recycle_files(paths: list[str]) -> tuple[list[str], list[dict]]:
+    """
+    Move already-vetted paths to the Recycle Bin and report the real outcome.
+    Returns (succeeded, failed[{path, reason}]).
+
+    SHFileOperationW can move some files and still return an error for the batch,
+    so the verdict for every path is decided by whether it is still on disk, never
+    by the batch return code alone.
+    """
+    succeeded: list[str] = []
+    failed: list[dict] = []
+
+    shell_paths = []
+    for p in paths:
+        if len(p) > MAX_SHELL_PATH:
+            failed.append({"path": p, "reason": "Path is longer than 259 characters — Windows cannot move it to the Recycle Bin"})
+        else:
+            shell_paths.append(p)
+
+    for i in range(0, len(shell_paths), RECYCLE_BATCH):
+        chunk = shell_paths[i:i + RECYCLE_BATCH]
+        _recycle_paths_windows(chunk)
+        for p in chunk:
+            if not os.path.lexists(p):
+                succeeded.append(p)
+                continue
+            # Still there: retry on its own to isolate a locked file.
+            ok, err = _recycle_paths_windows([p])
+            if not os.path.lexists(p):
+                succeeded.append(p)
+            else:
+                failed.append({"path": p, "reason": err or "File could not be moved to the Recycle Bin"})
+    return succeeded, failed
+
+
+def send_to_recycle_bin(paths: list[str], db_path: str, meta: dict | None = None) -> dict:
     """
     Move files to the Windows Recycle Bin (reversible).
-    Returns {"ok": True/False, "succeeded": [...], "failed": [...]}
+    meta: optional {path: (file_id, size, risk)} used to enrich the trash_log.
+    Returns {"ok": bool, "succeeded": [...], "failed": [...], "missing": [...]}
+    "missing" paths were already gone from disk — they count as succeeded.
+    No os.remove fallback — this function is reversible-only.
     """
-    succeeded = []
-    failed = []
-    trash_entries = []
+    meta = meta or {}
+    failed: list[dict] = []
+    missing: list[str] = []
+    safe: list[str] = []
 
     for p in paths:
-        ok, reason = _safety_check(p)
-        if not ok:
-            failed.append({"path": p, "reason": reason})
+        if not os.path.lexists(p):
+            missing.append(p)
             continue
-
-        # Capture size before moving — file won't be at original path afterward.
-        try:
-            size = os.path.getsize(p)
-        except Exception:
-            size = 0
-
-        # Process one file at a time so a single locked/inaccessible file
-        # does not cause the entire batch to fail.
-        ok, err = _recycle_paths_windows([p])
+        ok, reason = _safety_check(p)
         if ok:
-            entry_id = str(uuid.uuid4())
-            now_ts = datetime.now(timezone.utc).isoformat()
-            trash_entries.append((entry_id, None, p, size, None, now_ts, "recycle", 0, None))
-            succeeded.append(p)
+            safe.append(p)
         else:
-            failed.append({"path": p, "reason": err})
+            failed.append({"path": p, "reason": reason})
 
-    # Log to trash_log table
-    if trash_entries and db_path:
+    sizes = {}
+    for p in safe:
         try:
-            conn = sqlite3.connect(db_path, timeout=10)
+            sizes[p] = os.path.getsize(p)
+        except Exception:
+            sizes[p] = 0
+
+    moved, move_failed = recycle_files(safe)
+    failed.extend(move_failed)
+
+    if moved and db_path:
+        now_ts = datetime.now(timezone.utc).isoformat()
+        entries = []
+        for p in moved:
+            fid, size, risk = meta.get(p, (None, sizes.get(p, 0), None))
+            entries.append((str(uuid.uuid4()), fid, p, size or sizes.get(p, 0), risk, now_ts, "recycle", 0, None))
+        try:
+            conn = sqlite3.connect(db_path, timeout=15)
             conn.executemany(
                 "INSERT OR IGNORE INTO trash_log "
                 "(id,file_id,original_path,size,risk,trashed_at,method,restored,restored_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?)",
-                trash_entries,
+                entries,
             )
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            failed.append({"path": "trash log", "reason": f"Files were moved but the trash log could not be written: {e}"})
 
     return {
         "ok": len(failed) == 0,
-        "succeeded": succeeded,
+        "succeeded": moved + missing,
         "failed": failed,
+        "missing": missing,
     }
 
 
 def permanently_delete(paths: list[str], db_path: str) -> dict:
     """
-    Permanently delete files with a single-pass zero-overwrite (secure wipe).
-    REQUIRES that the caller has already verified permanent=True and user typed 'DELETE'.
+    Permanently delete files (no Recycle Bin, no overwrite pass — it is a plain delete).
+    Every path still goes through the same safety check as a recycle: protected system
+    data and HIGH-risk files are refused. Read-only files are handled.
+    Returns {"ok", "succeeded": [...], "failed": [{path, reason}], "missing": [...], "bytes_freed"}.
+    "missing" paths were already gone — they count as succeeded.
     """
-    succeeded = []
-    failed = []
+    succeeded: list[str] = []
+    failed: list[dict] = []
+    missing: list[str] = []
+    freed = 0
 
     for p in paths:
+        if not os.path.lexists(p):
+            missing.append(p)
+            continue
         ok, reason = _safety_check(p)
         if not ok:
             failed.append({"path": p, "reason": reason})
             continue
-
-        # Secure wipe: overwrite with zeros in chunks to avoid OOM on large files
         try:
             size = os.path.getsize(p)
-            chunk = b"\x00" * 65536
-            with open(p, "r+b") as f:
-                remaining = size
-                while remaining > 0:
-                    f.write(chunk if remaining >= 65536 else b"\x00" * remaining)
-                    remaining -= 65536
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception as e:
-            failed.append({"path": p, "reason": f"Overwrite failed: {e}"})
-            continue
-
-        # Now delete
+        except Exception:
+            size = 0
         try:
-            os.remove(p)
-            succeeded.append(p)
-            # Log to trash_log as permanent
-            if db_path:
-                try:
-                    entry_id = str(uuid.uuid4())
-                    now = datetime.now(timezone.utc).isoformat()
-                    conn = sqlite3.connect(db_path, timeout=10)
-                    conn.execute(
-                        "INSERT OR IGNORE INTO trash_log "
-                        "(id,file_id,original_path,size,risk,trashed_at,method,restored,restored_at) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)",
-                        (entry_id, None, p, 0, None, now, "permanent", 0, None),
-                    )
-                    conn.commit()
-                    conn.close()
-                except Exception:
-                    pass
+            try:
+                os.remove(p)
+            except PermissionError:
+                os.chmod(p, stat.S_IWRITE)      # read-only attribute
+                os.remove(p)
+        except FileNotFoundError:
+            missing.append(p)
+            continue
         except Exception as e:
-            failed.append({"path": p, "reason": f"Delete failed: {e}"})
+            reason = "File is in use by another application — close it and retry" \
+                if getattr(e, "winerror", None) in (32, 33) else f"Delete failed: {e}"
+            failed.append({"path": p, "reason": reason})
+            continue
+        if os.path.lexists(p):
+            failed.append({"path": p, "reason": "File is still present after delete"})
+            continue
+        succeeded.append(p)
+        freed += size
+
+    if succeeded and db_path:
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            conn = sqlite3.connect(db_path, timeout=15)
+            conn.executemany(
+                "INSERT OR IGNORE INTO trash_log "
+                "(id,file_id,original_path,size,risk,trashed_at,method,restored,restored_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                [(str(uuid.uuid4()), None, p, 0, None, now, "permanent", 0, None) for p in succeeded],
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass    # audit trail only — the files are already deleted
 
     return {
         "ok": len(failed) == 0,
-        "succeeded": succeeded,
+        "succeeded": succeeded + missing,
         "failed": failed,
+        "missing": missing,
+        "bytes_freed": freed,
     }
 
 
 # ---------------------------------------------------------------------------
-# Permanent deletion of files already sitting in the Recycle Bin
+# Recycle Bin access — find, restore and permanently delete items by $I/$R pair
 # ---------------------------------------------------------------------------
-def _parse_recycle_bin_path(i_file: str) -> str | None:
-    """
-    Read a $I metadata file and return the original path encoded inside it.
-    Windows Vista+ format:
-      version=1 → path at offset 24 (MAX_PATH*2 bytes, UTF-16LE)
-      version=2 → path length (DWORD) at 24, path at 28
-    Returns None if the file cannot be parsed.
-    """
+_FILETIME_EPOCH = 116444736000000000   # 100-ns ticks between 1601-01-01 and 1970-01-01
+_current_sid_cache: str | None = None
+
+# trash_log is stamped just after the move (a reclaim syncs every ~50 files, so within minutes)
+TRASH_TIME_BEFORE = 300
+TRASH_TIME_AFTER = 60
+
+
+class BinItem(NamedTuple):
+    i_file: str        # $I metadata file
+    r_file: str        # $R data file (or folder)
+    path: str          # original path recorded by Windows
+    size: int          # original size recorded by Windows
+    deleted_at: float  # epoch seconds
+
+
+def current_sid() -> str | None:
+    """SID string of the user running this process (names the per-user bin folder)."""
+    global _current_sid_cache
+    if _current_sid_cache is None:
+        try:
+            exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "whoami.exe")
+            out = subprocess.run([exe, "/user", "/fo", "csv", "/nh"], capture_output=True,
+                                 text=True, timeout=10).stdout.strip()
+            _current_sid_cache = out.split(",")[-1].strip().strip('"')
+        except Exception:
+            _current_sid_cache = ""
+    return _current_sid_cache or None
+
+
+def _bin_dir(drive_root: str) -> str | None:
+    sid = current_sid()
+    if not sid:
+        return None
+    d = os.path.join(drive_root, "$RECYCLE.BIN", sid)
+    return d if os.path.isdir(d) else None
+
+
+def _parse_i_file(i_file: str) -> tuple[str, int, float] | None:
+    """Parse a $I record -> (original_path, size, deleted_at_epoch), or None if unreadable.
+    v1 (Vista-8.1): path = 520 bytes at offset 24.  v2 (Win10+): char count at 24, path at 28."""
     try:
         with open(i_file, "rb") as f:
             data = f.read()
-        if len(data) < 24:
+        if len(data) < 28:
             return None
-        version = struct.unpack_from("<q", data, 0)[0]
+        version, size, ft = struct.unpack_from("<qqq", data, 0)
         if version == 1:
             raw = data[24:24 + 520]
-            return raw.decode("utf-16-le", errors="ignore").split("\x00")[0]
         elif version == 2:
-            if len(data) < 28:
-                return None
-            path_len = struct.unpack_from("<i", data, 24)[0]
-            raw = data[28:28 + path_len * 2]
-            return raw.decode("utf-16-le", errors="ignore").rstrip("\x00")
+            n = struct.unpack_from("<i", data, 24)[0]
+            raw = data[28:28 + n * 2]
+        else:
+            return None
+        path = raw.decode("utf-16-le", errors="ignore").split("\x00")[0]
+        if not path:
+            return None
+        return path, size, (ft - _FILETIME_EPOCH) / 1e7
     except Exception:
         return None
 
 
-def permanently_delete_from_recycle_bin(original_paths: list[str]) -> dict:
+def build_bin_index(drive_roots) -> tuple[dict[str, list[BinItem]], set[str]]:
     """
-    Permanently delete files that are already in the Windows Recycle Bin.
-    Scans $RECYCLE.BIN/{SID}/$I* metadata files to locate each item by its
-    original path, then deletes the $R (data) and $I (metadata) files.
-    Returns {"ok": bool, "succeeded": [...paths], "failed": [...],
-             "bytes_freed": int}
+    Index the current user's Recycle Bin on the given drives.
+    Returns ({path_key(original_path): [BinItem, ...]}, drives_that_were_readable).
+    Callers must only treat "absent from the index" as "gone" for readable drives.
     """
-    succeeded = []
-    failed = []
-    bytes_freed = 0
-
-    targets = {p.lower(): p for p in original_paths}
-
-    drives = set()
-    for p in original_paths:
-        drive = os.path.splitdrive(p)[0]
-        if drive:
-            drives.add(drive + "\\")
-
-    found_map: dict[str, tuple[str, str, int]] = {}
-
-    for drive_root in drives:
-        recycle_root = os.path.join(drive_root, "$RECYCLE.BIN")
-        if not os.path.exists(recycle_root):
+    index: dict[str, list[BinItem]] = {}
+    readable: set[str] = set()
+    for root in drive_roots:
+        root = root.upper()
+        d = _bin_dir(root)
+        if d is None:
             continue
         try:
-            sid_dirs = os.listdir(recycle_root)
-        except PermissionError:
+            with os.scandir(d) as it:
+                names = [e.name for e in it]
+        except OSError:
             continue
-        for sid_name in sid_dirs:
-            sid_path = os.path.join(recycle_root, sid_name)
-            if not os.path.isdir(sid_path):
+        readable.add(root)
+        for name in names:
+            if not name.upper().startswith("$I"):
                 continue
-            try:
-                items = os.listdir(sid_path)
-            except PermissionError:
+            i_file = os.path.join(d, name)
+            parsed = _parse_i_file(i_file)
+            if parsed is None:
                 continue
-            for fname in items:
-                if not fname.upper().startswith("$I"):
-                    continue
-                i_file = os.path.join(sid_path, fname)
-                orig = _parse_recycle_bin_path(i_file)
-                if orig is None:
-                    continue
-                key = orig.lower()
-                if key not in targets:
-                    continue
-                r_name = "$R" + fname[2:]
-                r_file = os.path.join(sid_path, r_name)
-                size = 0
-                try:
-                    if os.path.exists(r_file):
-                        size = os.path.getsize(r_file)
-                except Exception:
-                    pass
-                found_map[key] = (i_file, r_file, size)
+            path, size, ts = parsed
+            index.setdefault(path_key(path), []).append(
+                BinItem(i_file, os.path.join(d, "$R" + name[2:]), path, size, ts))
+    for items in index.values():
+        items.sort(key=lambda b: b.deleted_at)
+    return index, readable
 
-    for lower_path, orig_path in targets.items():
-        if lower_path in found_map:
-            i_file, r_file, size = found_map[lower_path]
+
+def path_key(path: str) -> str:
+    """Canonical lookup key for a path: case-folded, one separator style, no '.'/'..'."""
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _drive_root(path: str) -> str:
+    return os.path.splitdrive(path)[0].upper() + "\\"
+
+
+def _pick_items(items: list[BinItem], trashed_at: list[float] | None) -> list[BinItem]:
+    """Items for one path that belong to this app. With trash-log timestamps, only records
+    deleted just before a logged trash time qualify; without any, all of them."""
+    if not trashed_at:
+        return items
+    return [b for b in items
+            if any(t - TRASH_TIME_BEFORE <= b.deleted_at <= t + TRASH_TIME_AFTER for t in trashed_at)]
+
+
+def _inside(child: str, parent: str) -> bool:
+    try:
+        child = os.path.normcase(os.path.realpath(child))
+        parent = os.path.normcase(os.path.realpath(parent))
+        return os.path.commonpath([child, parent]) == parent and child != parent
+    except ValueError:
+        return False
+
+
+def _force_remove(path: str) -> None:
+    """Remove a file or folder, clearing the read-only attribute if needed."""
+    def _onerror(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path, onerror=_onerror)
+    else:
+        try:
+            os.remove(path)
+        except PermissionError:
+            os.chmod(path, stat.S_IWRITE)
+            os.remove(path)
+
+
+def delete_from_recycle_bin(entries: list[tuple[str, list[float] | None]]) -> dict:
+    """
+    Permanently delete items from the Recycle Bin.
+    entries: [(original_path, [trashed_at_epoch, ...] | None)]
+    Returns {"ok", "succeeded": [paths], "failed": [{path, reason}], "bytes_freed"}.
+    A path that is no longer in a readable bin counts as already gone (succeeded).
+    """
+    succeeded, failed, freed, unavailable = [], [], 0, []
+    drives = {_drive_root(p) for p, _ in entries if os.path.splitdrive(p)[0]}
+    index, readable = build_bin_index(drives)
+
+    for path, trashed_at in entries:
+        root = _drive_root(path)
+        if root not in readable:
+            if not os.path.exists(root):
+                unavailable.append(path)      # drive not connected: its bin cannot be reached at all
+            else:
+                failed.append({"path": path, "reason": f"Recycle Bin on {root} could not be read"})
+            continue
+        bin_dir = _bin_dir(root)
+        ok = True
+        for b in _pick_items(index.get(path_key(path), []), trashed_at):
+            if not (_inside(b.i_file, bin_dir) and (not os.path.lexists(b.r_file) or _inside(b.r_file, bin_dir))):
+                failed.append({"path": path, "reason": "Path escapes the Recycle Bin — refused"})
+                ok = False
+                break
             try:
-                if os.path.exists(r_file):
-                    os.remove(r_file)
-                os.remove(i_file)
-                succeeded.append(orig_path)
-                bytes_freed += size
+                if os.path.lexists(b.r_file):
+                    _force_remove(b.r_file)     # data first: if this fails the $I record stays valid
+                _force_remove(b.i_file)
+                freed += b.size
             except Exception as e:
-                failed.append({"path": orig_path, "reason": str(e)})
-        else:
-            # Not found in Recycle Bin — already gone, just clean DB record
-            succeeded.append(orig_path)
+                failed.append({"path": path, "reason": f"Could not remove from Recycle Bin: {e}"})
+                ok = False
+                break
+        if ok:
+            succeeded.append(path)
+    return {"ok": not failed, "succeeded": succeeded, "failed": failed, "bytes_freed": freed,
+            "unavailable": unavailable}
 
-    return {
-        "ok": len(failed) == 0,
-        "succeeded": succeeded,
-        "failed": failed,
-        "bytes_freed": bytes_freed,
-    }
+
+def restore_from_recycle_bin(entries: list[tuple[str, list[float] | None]]) -> dict:
+    """Move items back from the Recycle Bin to their original location (never overwrites)."""
+    succeeded, failed = [], []
+    drives = {_drive_root(p) for p, _ in entries if os.path.splitdrive(p)[0]}
+    index, readable = build_bin_index(drives)
+    for path, trashed_at in entries:
+        root = _drive_root(path)
+        if root not in readable:
+            failed.append({"path": path, "reason": f"Recycle Bin on {root} could not be read"})
+            continue
+        items = _pick_items(index.get(path_key(path), []), trashed_at)
+        if not items:
+            failed.append({"path": path, "reason": "Not found in the Recycle Bin (already restored or emptied)"})
+            continue
+        b = items[-1]                      # newest deletion of that path
+        if os.path.lexists(path):
+            failed.append({"path": path, "reason": "A file already exists at the original location"})
+            continue
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            os.replace(b.r_file, path)
+            _force_remove(b.i_file)
+            succeeded.append(path)
+        except Exception as e:
+            failed.append({"path": path, "reason": f"Restore failed: {e}"})
+    return {"ok": not failed, "succeeded": succeeded, "failed": failed}

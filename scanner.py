@@ -13,6 +13,12 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+
+def _path_id(path: str) -> str:
+    """Deterministic 32-char hex ID from path. Avoids os.urandom() syscall per file.
+    Same file always gets same ID → future incremental scans can use INSERT OR IGNORE."""
+    return hashlib.blake2b(path.encode("utf-8", errors="replace"), digest_size=16).hexdigest()
+
 from classifier import classify, PROTECTED_PATHS, is_protected
 
 # ---------------------------------------------------------------------------
@@ -149,6 +155,7 @@ def _init_db(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_active_cat  ON files(in_trash, protected, category, size DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_active_dup  ON files(in_trash, protected, is_duplicate, size DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_active_path ON files(in_trash, protected, path)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_path        ON files(path)")
     conn.commit()
 
 
@@ -171,6 +178,11 @@ def scan(db_path: str, progress_q: queue.Queue, cancel_flag) -> None:
 
     conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     _init_db(conn)
+    # Speed up scan: eliminate fsync on intermediate commits.
+    # Safe because partial scans are discarded on restart (DELETE FROM files at start).
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA cache_size=-131072")  # 128 MB during scan
+    conn.execute("PRAGMA mmap_size=536870912") # 512 MB mmap
 
     # Clear previous scan data
     conn.execute("DELETE FROM files")
@@ -235,7 +247,7 @@ def scan(db_path: str, progress_q: queue.Queue, cancel_flag) -> None:
                     cls = classify(fpath, size, st)
 
                     batch.append((
-                        str(uuid.uuid4()), scan_id, fpath, drive, size,
+                        _path_id(fpath), scan_id, fpath, drive, size,
                         cls["risk"], cls["risk_reason"], cls["type"], cls["category"],
                         last_accessed, last_modified,
                         1 if cls["protected"] else 0,
@@ -338,12 +350,11 @@ def scan(db_path: str, progress_q: queue.Queue, cancel_flag) -> None:
                 if len(dupes) < 2:
                     continue
                 group_id = fh[:12]
-                for (fid, _) in dupes:
-                    conn.execute(
-                        "UPDATE files SET is_duplicate=1, duplicate_group=?, category='Duplicates' WHERE id=?",
-                        (group_id, fid),
-                    )
-                    dup_count += 1
+                conn.executemany(
+                    "UPDATE files SET is_duplicate=1, duplicate_group=?, category='Duplicates' WHERE id=?",
+                    [(group_id, fid) for (fid, _) in dupes],
+                )
+                dup_count += len(dupes)
         conn.commit()
 
     # -----------------------------------------------------------------------
@@ -363,8 +374,9 @@ def scan(db_path: str, progress_q: queue.Queue, cancel_flag) -> None:
     conn.commit()
 
     # -----------------------------------------------------------------------
-    # Finalise
+    # Finalise — restore durable sync before final commit
     # -----------------------------------------------------------------------
+    conn.execute("PRAGMA synchronous=NORMAL")
     finished_at = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "UPDATE scan_meta SET status=?, finished_at=?, total_files=?, total_size=? WHERE scan_id=?",

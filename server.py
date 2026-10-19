@@ -28,11 +28,12 @@ from classifier import is_protected
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-PORT = 8765
-DB_PATH = os.path.join(os.path.dirname(__file__), "scan_results.db")
+PORT = int(os.environ.get("CLEANUP_PORT", "8765"))
+DB_PATH = os.environ.get("CLEANUP_DB") or os.path.join(os.path.dirname(__file__), "scan_results.db")
 DASHBOARD_HTML = os.path.join(os.path.dirname(__file__), "dashboard.html")
 PAGE_SIZE = 100
 LARGE_FILE_MIN = 100 * 1024 * 1024   # 100 MB — must match scanner.py
+RECONCILE_TTL = float(os.environ.get("CLEANUP_RECONCILE_TTL", "15"))   # seconds between trash-list syncs with the Recycle Bin
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +59,7 @@ class AppState:
         self._summary_cache: dict = {}
         self._summary_cache_ts: float = 0.0
         self._summary_cache_lock = threading.Lock()
+        self.last_reconcile: float = 0.0
 
     def is_scanning(self):
         with self.lock:
@@ -91,6 +93,12 @@ class AppState:
 
 STATE = AppState()
 
+# HTML cached at startup — avoids sync file I/O on every request thread.
+# Restart server after editing dashboard.html to pick up changes.
+_HTML_BYTES: bytes = b""
+
+MAX_SSE_CLIENTS = 10
+
 
 # ---------------------------------------------------------------------------
 # DB Helpers
@@ -99,8 +107,10 @@ def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA cache_size=-32000")   # 32 MB page cache
-    conn.execute("PRAGMA temp_store=MEMORY")   # temp tables in RAM
+    conn.execute("PRAGMA cache_size=-65536")    # 64 MB page cache
+    conn.execute("PRAGMA temp_store=MEMORY")    # temp tables in RAM
+    conn.execute("PRAGMA mmap_size=536870912")  # 512 MB memory-mapped I/O
+    conn.execute("PRAGMA read_uncommitted=1")   # safe in WAL: readers don't block writers
     return conn
 
 
@@ -137,6 +147,7 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_active_cat  ON files(in_trash, protected, category, size DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_active_dup  ON files(in_trash, protected, is_duplicate, size DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_active_path ON files(in_trash, protected, path)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_path        ON files(path)")
     conn.commit()
     conn.close()
 
@@ -204,10 +215,11 @@ def db_summary() -> dict:
         # Trash count and large_count need dedicated queries;
         # cache_count and dup_count are derived from by_cat above (saves 2 queries).
         trash_count = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE in_trash=1"
+            "SELECT COUNT(*) FROM trash_log WHERE restored=0 AND method='recycle'"
         ).fetchone()[0]
         large_count = conn.execute(
-            f"SELECT COUNT(*) FROM files WHERE in_trash=0 AND protected=0 AND size >= {LARGE_FILE_MIN}"
+            "SELECT COUNT(*) FROM files WHERE in_trash=0 AND protected=0 AND size >= ?",
+            (LARGE_FILE_MIN,),
         ).fetchone()[0]
 
         conn.close()
@@ -266,6 +278,83 @@ def db_summary() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Trash helpers — the Trash tab is a view of trash_log (survives re-scans)
+# ---------------------------------------------------------------------------
+def _clean_ids(ids) -> list:
+    if not isinstance(ids, list):
+        return []
+    return [i for i in ids if isinstance(i, str) and 1 <= len(i) <= 64 and i.replace("-", "").isalnum()]
+
+
+def _trash_entries(ids: list | None = None) -> list:
+    """Unrestored Recycle Bin entries from trash_log (optionally just the given ids)."""
+    conn = get_db()
+    try:
+        if ids is None:
+            rows = conn.execute(
+                "SELECT id,original_path,trashed_at,size FROM trash_log WHERE restored=0 AND method='recycle'"
+            ).fetchall()
+        else:
+            rows = []
+            for i in range(0, len(ids), 500):
+                part = ids[i:i + 500]
+                ph = ",".join("?" * len(part))
+                rows += conn.execute(
+                    f"SELECT id,original_path,trashed_at,size FROM trash_log "
+                    f"WHERE restored=0 AND method='recycle' AND id IN ({ph})", part
+                ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _epoch(iso: str) -> float | None:
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except Exception:
+        return None
+
+
+def _group_by_path(entries: list) -> list:
+    """[(original_path, [trashed_at_epoch, ...])] — one item per distinct path."""
+    grouped: dict = {}
+    for e in entries:
+        t = _epoch(e["trashed_at"])
+        grouped.setdefault(e["original_path"], [])
+        if t is not None:
+            grouped[e["original_path"]].append(t)
+    return [(p, ts or None) for p, ts in grouped.items()]
+
+
+def reconcile_trash_log(force: bool = False) -> None:
+    """Drop trash_log entries whose item is no longer in the Recycle Bin (restored or emptied
+    outside this app). Only drives whose bin could actually be read are judged."""
+    if not force and time.monotonic() - STATE.last_reconcile < RECONCILE_TTL:
+        return
+    STATE.last_reconcile = time.monotonic()
+    try:
+        entries = _trash_entries()
+        if not entries:
+            return
+        drives = {rc._drive_root(e["original_path"]) for e in entries if os.path.splitdrive(e["original_path"])[0]}
+        index, readable = rc.build_bin_index(drives)
+        stale = [e for e in entries
+                 if rc._drive_root(e["original_path"]) in readable
+                 and rc.path_key(e["original_path"]) not in index]
+        if not stale:
+            return
+        conn = get_db()
+        conn.executemany("DELETE FROM trash_log WHERE id=?", [(e["id"],) for e in stale])
+        back = [(e["original_path"],) for e in stale if os.path.exists(e["original_path"])]
+        conn.executemany("UPDATE files SET in_trash=0 WHERE path=?", back)
+        conn.commit()
+        conn.close()
+        _invalidate_summary_cache()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Background scan launcher
 # ---------------------------------------------------------------------------
 def _run_scan():
@@ -302,82 +391,74 @@ def _progress_dispatcher():
 # ---------------------------------------------------------------------------
 # Background reclaim job
 # ---------------------------------------------------------------------------
+def _sync_trashed(conn, paths: list, meta: dict) -> None:
+    """Mark paths as trashed in the files table and log them in trash_log."""
+    now_ts = datetime.now(timezone.utc).isoformat()
+    log_rows = []
+    for p in paths:
+        fid, size, risk = meta.get(p, (None, 0, None))
+        log_rows.append((str(uuid.uuid4()), fid, p, size, risk, now_ts, "recycle", 0, None))
+    conn.executemany("UPDATE files SET in_trash=1 WHERE path=?", [(p,) for p in paths])
+    conn.executemany(
+        "INSERT OR IGNORE INTO trash_log "
+        "(id,file_id,original_path,size,risk,trashed_at,method,restored,restored_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        log_rows,
+    )
+    conn.commit()
+
+
 def _run_reclaim_bg(risks: list) -> None:
-    """Recycle SAFE/LOW files one at a time in a background thread.
-    Batching 500+ files into a single SHFileOperationW call hangs — process
-    files individually so locked/inaccessible files fail fast without blocking."""
-    DB_SYNC_INTERVAL = 50   # write to DB every N successes
+    """Recycle SAFE/LOW files in batches. rc.recycle_files decides each file's outcome
+    from what is actually on disk, so a partly-successful batch is never miscounted."""
+    BATCH_SIZE = 25
+    DB_SYNC_INTERVAL = 50
     try:
         conn = get_db()
         ph = ",".join("?" * len(risks))
         rows = conn.execute(
-            f"SELECT path FROM files WHERE in_trash=0 AND protected=0 AND risk IN ({ph})",
+            f"SELECT id,path,size,risk FROM files WHERE in_trash=0 AND protected=0 AND risk IN ({ph})",
             risks,
         ).fetchall()
-        conn.close()
     except Exception as e:
         with STATE.reclaim_job_lock:
             STATE.reclaim_job.update({"status": "error", "error": str(e)})
         return
 
-    # Pre-filter to files that actually exist on disk right now.
-    all_paths = [r["path"] for r in rows
-                 if os.path.isfile(r["path"]) and not is_protected(r["path"])]
+    meta = {r["path"]: (r["id"], r["size"], r["risk"]) for r in rows}
+    all_paths = [r["path"] for r in rows if os.path.isfile(r["path"]) and rc._safety_check(r["path"])[0]]
     with STATE.reclaim_job_lock:
         STATE.reclaim_job["total"] = len(all_paths)
 
     succeeded: list[str] = []
     failed_count = 0
     db_synced = 0
+    db_error = ""
 
-    for p in all_paths:
-        ok, _ = rc._recycle_paths_windows([p])
-        if ok:
-            succeeded.append(p)
-        else:
-            failed_count += 1
+    for i in range(0, len(all_paths), BATCH_SIZE):
+        chunk = all_paths[i:i + BATCH_SIZE]
+        ok_paths, fail_paths = rc.recycle_files(chunk)
+        succeeded.extend(ok_paths)
+        failed_count += len(fail_paths)
 
-        # Persist DB every DB_SYNC_INTERVAL successes
-        new_ok = succeeded[db_synced:]
-        if len(new_ok) >= DB_SYNC_INTERVAL:
+        if len(succeeded) - db_synced >= DB_SYNC_INTERVAL:
             try:
-                conn = get_db()
-                now_ts = datetime.now(timezone.utc).isoformat()
-                conn.executemany("UPDATE files SET in_trash=1 WHERE path=?", [(p,) for p in new_ok])
-                conn.executemany(
-                    "INSERT OR IGNORE INTO trash_log "
-                    "(id,file_id,original_path,size,risk,trashed_at,method,restored,restored_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    [(str(uuid.uuid4()), None, p, 0, None, now_ts, "recycle", 0, None) for p in new_ok],
-                )
-                conn.commit()
-                conn.close()
+                _sync_trashed(conn, succeeded[db_synced:], meta)
                 db_synced = len(succeeded)
-            except Exception:
-                pass
+            except Exception as e:
+                db_error = str(e)
 
         with STATE.reclaim_job_lock:
             STATE.reclaim_job["succeeded"] = len(succeeded)
             STATE.reclaim_job["failed_count"] = failed_count
 
-    # Final DB sync for any remaining succeeded files
-    new_ok = succeeded[db_synced:]
-    if new_ok:
+    if len(succeeded) > db_synced:
         try:
-            conn = get_db()
-            now_ts = datetime.now(timezone.utc).isoformat()
-            conn.executemany("UPDATE files SET in_trash=1 WHERE path=?", [(p,) for p in new_ok])
-            conn.executemany(
-                "INSERT OR IGNORE INTO trash_log "
-                "(id,file_id,original_path,size,risk,trashed_at,method,restored,restored_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                [(str(uuid.uuid4()), None, p, 0, None, now_ts, "recycle", 0, None) for p in new_ok],
-            )
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
+            _sync_trashed(conn, succeeded[db_synced:], meta)
+        except Exception as e:
+            db_error = str(e)
 
+    conn.close()
     _invalidate_summary_cache()
     with STATE.reclaim_job_lock:
         STATE.reclaim_job.update({
@@ -385,6 +466,8 @@ def _run_reclaim_bg(risks: list) -> None:
             "succeeded": len(succeeded),
             "failed_count": failed_count,
         })
+        if db_error:
+            STATE.reclaim_job["error"] = f"Files were moved but the list could not be updated: {db_error}"
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +488,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _send_cors(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", f"http://localhost:{PORT}")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
@@ -414,10 +497,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", f"http://localhost:{PORT}")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _validate_origin(self) -> bool:
+        """Reject cross-origin POST/DELETE — simple CSRF mitigation for localhost server."""
+        origin = self.headers.get("Origin", "")
+        if not origin:
+            return True  # non-browser clients (curl, scripts) send no Origin
+        return origin in {f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"}
 
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
@@ -453,6 +543,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
+        if not self._validate_origin():
+            self._json({"error": "Forbidden"}, 403)
+            return
         path = urlparse(self.path).path.rstrip("/")
 
         if path == "/api/scan/start":
@@ -465,12 +558,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_restore()
         elif path == "/api/trash/remove":
             self._handle_trash_remove()
+        elif path == "/api/trash/clear":
+            self._handle_trash_clear()
         elif path == "/api/reclaim":
             self._handle_reclaim()
         else:
             self._json({"error": "not found"}, 404)
 
     def do_DELETE(self):
+        if not self._validate_origin():
+            self._json({"error": "Forbidden"}, 403)
+            return
         path = urlparse(self.path).path.rstrip("/")
         if path == "/api/delete":
             self._handle_delete()
@@ -479,17 +577,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     # -----------------------------------------------------------------------
     def _serve_html(self):
-        try:
-            with open(DASHBOARD_HTML, "rb") as f:
-                body = f.read()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-        except FileNotFoundError:
+        if not _HTML_BYTES:
             self._json({"error": "dashboard.html not found"}, 404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(_HTML_BYTES)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.end_headers()
+        self.wfile.write(_HTML_BYTES)
 
     def _handle_status(self):
         with STATE.lock:
@@ -525,6 +623,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_sse(self):
         """Server-Sent Events endpoint for scan progress."""
+        with STATE.sse_lock:
+            if len(STATE.sse_clients) >= MAX_SSE_CLIENTS:
+                self._json({"error": "Too many SSE connections"}, 429)
+                return
         client_q: queue.Queue = queue.Queue(maxsize=100)
         STATE.add_sse_client(client_q)
 
@@ -569,6 +671,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
         finally:
             STATE.remove_sse_client(client_q)
 
+    def _handle_trash_results(self, qs: dict, sort: str, direction: str, page: int):
+        """Trash tab: Recycle Bin items this app trashed (from trash_log)."""
+        reconcile_trash_log()
+        col = {"size": "size", "path": "original_path", "risk": "COALESCE(risk,'')",
+               "type": "method", "category": "method",
+               "last_accessed": "trashed_at", "last_modified": "trashed_at"}[sort]
+        where, params = ["restored=0", "method='recycle'"], []
+        risk = qs.get("risk", "").upper()
+        if risk in ("SAFE", "LOW", "MEDIUM", "HIGH"):
+            where.append("risk=?")
+            params.append(risk)
+        drive = qs.get("drive", "")
+        if drive and len(drive) == 1 and drive.isalpha():
+            where.append("UPPER(SUBSTR(original_path,1,1))=?")
+            params.append(drive.upper())
+        if qs.get("q"):
+            where.append("LOWER(original_path) LIKE ?")
+            params.append(f"%{qs['q'].lower()}%")
+        where_sql = " AND ".join(where)
+        conn = get_db()
+        total = conn.execute(f"SELECT COUNT(*) FROM trash_log WHERE {where_sql}", params).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT id,original_path,size,risk,trashed_at FROM trash_log WHERE {where_sql} "
+            f"ORDER BY {col} {direction} LIMIT ? OFFSET ?",
+            params + [PAGE_SIZE, page * PAGE_SIZE],
+        ).fetchall()
+        conn.close()
+        results = [{
+            "id": r["id"], "path": r["original_path"], "drive": r["original_path"][:1].upper(),
+            "size": r["size"] or 0, "risk": r["risk"] or "UNKNOWN", "risk_reason": "",
+            "type": "trash", "category": "Trash",
+            "last_accessed": r["trashed_at"], "last_modified": r["trashed_at"],
+            "is_duplicate": 0, "duplicate_group": None, "in_trash": 1,
+        } for r in rows]
+        self._json({"total": total, "page": page, "page_size": PAGE_SIZE, "results": results})
+
     def _handle_results(self):
         qs = self._parse_qs()
         tab = qs.get("tab", "all")
@@ -576,7 +714,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         q = qs.get("q", "")
         sort = qs.get("sort", "size")
         direction = qs.get("dir", "desc")
-        page = max(0, int(qs.get("page", "0")))
+        try:
+            page = max(0, int(qs.get("page", "0")))
+        except ValueError:
+            page = 0
 
         allowed_sorts = {"size", "risk", "type", "category", "last_accessed", "last_modified", "path"}
         if sort not in allowed_sorts:
@@ -584,6 +725,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         direction = "DESC" if direction.lower() != "asc" else "ASC"
 
         try:
+            if tab == "trash":
+                self._handle_trash_results(qs, sort, direction, page)
+                return
             conn = get_db()
             where_parts = ["in_trash=0", "protected=0"]
             params: list = []
@@ -593,10 +737,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif tab == "duplicates":
                 where_parts.append("is_duplicate=1")
             elif tab == "large":
-                where_parts.append(f"size >= {LARGE_FILE_MIN}")
-            elif tab == "trash":
-                where_parts.remove("in_trash=0")
-                where_parts.append("in_trash=1")
+                where_parts.append("size >= ?")
+                params.append(LARGE_FILE_MIN)
 
             if risk and risk.upper() in ("SAFE", "LOW", "MEDIUM", "HIGH"):
                 where_parts.append("risk=?")
@@ -616,10 +758,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 where_parts.append("LOWER(path) LIKE ?")
                 params.append(f"%{q.lower()}%")
 
-            where_sql = " AND ".join(where_parts) if where_parts else "1=1"
+            where_sql = " AND ".join(where_parts)
             offset = page * PAGE_SIZE
 
-            total = conn.execute(f"SELECT COUNT(*) FROM files WHERE {where_sql}", params).fetchone()[0]
+            total = conn.execute(f"SELECT COUNT(*) FROM files WHERE {where_sql}", list(params)).fetchone()[0]
             rows = conn.execute(
                 f"SELECT id,path,drive,size,risk,risk_reason,type,category,"
                 f"last_accessed,last_modified,is_duplicate,duplicate_group,in_trash "
@@ -653,102 +795,106 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json({"error": str(e)}, 500)
 
     def _handle_delete(self):
+        """Delete active files: to the Recycle Bin (default) or permanently (permanent=true)."""
         body = self._read_body()
         ids = body.get("ids", [])
-        permanent = body.get("permanent", False)
+        permanent = body.get("permanent") is True
 
-        if not ids:
+        if not isinstance(ids, list) or not ids:
             self._json({"error": "No ids provided"}, 400)
             return
 
-        # Resolve paths from DB — separate trash items from active items
+        # Validate IDs — must be non-empty alphanumeric strings (UUIDs); reject anything else.
+        ids = [i for i in ids if isinstance(i, str) and 1 <= len(i) <= 64 and i.replace("-", "").isalnum()]
+        if not ids:
+            self._json({"error": "No valid ids provided"}, 400)
+            return
+
         try:
             conn = get_db()
-            placeholders = ",".join("?" * len(ids))
-            rows = conn.execute(
-                f"SELECT id,path,size,risk,in_trash FROM files WHERE id IN ({placeholders})",
-                ids,
-            ).fetchall()
+            rows = []
+            for i in range(0, len(ids), 500):
+                part = ids[i:i + 500]
+                ph = ",".join("?" * len(part))
+                rows += conn.execute(
+                    f"SELECT id,path,size,risk FROM files WHERE in_trash=0 AND id IN ({ph})", part
+                ).fetchall()
             conn.close()
         except Exception as e:
             self._json({"error": str(e)}, 500)
             return
 
-        # Items already in trash: they're in Windows Recycle Bin — just remove from our DB
-        trash_ids = [r["id"] for r in rows if r["in_trash"]]
-        active_rows = [r for r in rows if not r["in_trash"]]
+        found = {r["id"] for r in rows}
+        failed = [{"path": i, "reason": "Not in the current scan results"} for i in ids if i not in found]
+        paths = [r["path"] for r in rows]
+        meta = {r["path"]: (r["id"], r["size"], r["risk"]) for r in rows}
 
-        succeeded = []
-        failed = []
+        try:
+            if permanent:
+                result = rc.permanently_delete(paths, DB_PATH)
+            else:
+                result = rc.send_to_recycle_bin(paths, DB_PATH, meta)
+        except Exception as e:
+            result = {"succeeded": [], "failed": [{"path": p, "reason": str(e)} for p in paths], "missing": []}
 
-        # Remove trash-tab items from DB (they're already in Recycle Bin)
-        if trash_ids:
+        succeeded = result.get("succeeded", [])
+        failed += result.get("failed", [])
+
+        # Reflect the real on-disk outcome in the list.
+        db_error = ""
+        if succeeded:
             try:
                 conn = get_db()
-                ph = ",".join("?" * len(trash_ids))
-                removed = conn.execute(f"SELECT path FROM files WHERE id IN ({ph})", trash_ids).fetchall()
-                conn.execute(f"DELETE FROM files WHERE id IN ({ph})", trash_ids)
+                sql = ("DELETE FROM files WHERE path=?" if permanent
+                       else "UPDATE files SET in_trash=1 WHERE path=?")
+                conn.executemany(sql, [(p,) for p in succeeded])
                 conn.commit()
                 conn.close()
-                succeeded.extend([r["path"] for r in removed])
             except Exception as e:
-                failed.append({"path": "trash items", "reason": str(e)})
-
-        # Active items: send to Recycle Bin or permanently delete
-        if active_rows:
-            paths = [r["path"] for r in active_rows]
-            try:
-                if permanent:
-                    result = rc.permanently_delete(paths, DB_PATH)
-                else:
-                    result = rc.send_to_recycle_bin(paths, DB_PATH)
-            except Exception as e:
-                result = {"succeeded": [], "failed": [{"path": p, "reason": str(e)} for p in paths]}
-
-            succeeded.extend(result.get("succeeded", []))
-            failed.extend(result.get("failed", []))
-
-            # Mark active files in DB
-            if result.get("succeeded"):
-                try:
-                    conn = get_db()
-                    if permanent:
-                        conn.executemany("DELETE FROM files WHERE path=?", [(p,) for p in result["succeeded"]])
-                    else:
-                        conn.executemany("UPDATE files SET in_trash=1 WHERE path=?", [(p,) for p in result["succeeded"]])
-                    conn.commit()
-                    conn.close()
-                except Exception:
-                    pass
+                db_error = str(e)
+                failed.append({"path": "list update", "reason": f"Files were processed but the list could not be updated: {e}"})
 
         _invalidate_summary_cache()
-        self._json({"ok": len(failed) == 0, "succeeded": succeeded, "failed": failed})
+        self._json({
+            "ok": len(failed) == 0,
+            "succeeded": succeeded,
+            "failed": failed,
+            "missing": result.get("missing", []),
+            "db_error": db_error,
+        })
 
     def _handle_restore(self):
+        """Restore Recycle Bin items back to their original location. Accepts id or ids."""
         body = self._read_body()
-        file_id = body.get("id", "")
-        if not file_id:
+        ids = body.get("ids") or ([body["id"]] if body.get("id") else [])
+        ids = _clean_ids(ids)
+        if not ids:
             self._json({"error": "No id provided"}, 400)
             return
 
         try:
-            conn = get_db()
-            row = conn.execute("SELECT path FROM files WHERE id=?", (file_id,)).fetchone()
-            if not row:
-                conn.close()
-                self._json({"error": "File not found"}, 404)
+            entries = _trash_entries(ids)
+            if not entries:
+                self._json({"error": "Item is no longer in the trash list"}, 404)
                 return
-            path = row["path"]
+            result = rc.restore_from_recycle_bin(_group_by_path(entries))
+            done = set(result["succeeded"])
             now = datetime.now(timezone.utc).isoformat()
-            conn.execute("UPDATE files SET in_trash=0 WHERE id=?", (file_id,))
-            conn.execute(
-                "UPDATE trash_log SET restored=1, restored_at=? WHERE original_path=? AND restored=0",
-                (now, path),
-            )
+            conn = get_db()
+            restored_ids = [e["id"] for e in entries if e["original_path"] in done]
+            conn.executemany("UPDATE trash_log SET restored=1, restored_at=? WHERE id=?",
+                             [(now, i) for i in restored_ids])
+            conn.executemany("UPDATE files SET in_trash=0 WHERE path=?", [(p,) for p in done])
             conn.commit()
             conn.close()
             _invalidate_summary_cache()
-            self._json({"ok": True, "path": path})
+            self._json({
+                "ok": result["ok"],
+                "restored": len(restored_ids),
+                "path": entries[0]["original_path"],
+                "failed": result["failed"],
+                "error": result["failed"][0]["reason"] if result["failed"] else "",
+            })
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
@@ -790,41 +936,54 @@ class DashboardHandler(BaseHTTPRequestHandler):
             job = dict(STATE.reclaim_job)
         self._json(job)
 
-    def _handle_trash_remove(self):
-        """Remove trash records from the DB. Files are already in Windows Recycle Bin;
-        scanning 200K+ $I files to find them hangs the server, so we skip that and just
-        clean our tracking records. User can empty the Recycle Bin via Windows to free space."""
-        body = self._read_body()
-        ids = body.get("ids", [])
-        if not ids:
-            self._json({"error": "No ids provided"}, 400)
-            return
+    def _empty_bin_entries(self, entries: list) -> None:
+        """Permanently delete the given trash_log entries from the Recycle Bin, then drop them
+        from the list. Only items this app recycled are touched — never the whole bin."""
         try:
+            result = rc.delete_from_recycle_bin(_group_by_path(entries))
+            offline = set(result.get("unavailable", []))
+            done = set(result["succeeded"]) | offline          # unreachable drive: drop from list only
+            gone_ids = [e["id"] for e in entries if e["original_path"] in done]
+            offline_n = len([e for e in entries if e["original_path"] in offline])
             conn = get_db()
-            ph = ",".join("?" * len(ids))
-            rows = conn.execute(
-                f"SELECT id, path FROM files WHERE id IN ({ph})", ids
-            ).fetchall()
-            paths = [r["path"] for r in rows]
-            if paths:
-                conn.execute(f"DELETE FROM files WHERE id IN ({ph})", ids)
-                conn.executemany(
-                    "DELETE FROM trash_log WHERE original_path=?",
-                    [(p,) for p in paths],
-                )
-                conn.commit()
+            conn.executemany("DELETE FROM trash_log WHERE id=?", [(i,) for i in gone_ids])
+            conn.executemany("DELETE FROM files WHERE path=? AND in_trash=1", [(p,) for p in done])
+            conn.commit()
             conn.close()
         except Exception as e:
             self._json({"error": str(e)}, 500)
             return
-
         _invalidate_summary_cache()
+        STATE.last_reconcile = time.monotonic()
         self._json({
-            "ok": True,
-            "removed": len(paths),
-            "bytes_freed": 0,
-            "failed": [],
+            "ok": result["ok"],
+            "removed": len(gone_ids) - offline_n,
+            "unavailable": offline_n,
+            "bytes_freed": result["bytes_freed"],
+            "failed": result["failed"],
         })
+
+    def _handle_trash_clear(self):
+        """Empty Trash: permanently delete every Recycle Bin item this app trashed."""
+        try:
+            entries = _trash_entries()
+        except Exception as e:
+            self._json({"error": str(e)}, 500)
+            return
+        self._empty_bin_entries(entries)
+
+    def _handle_trash_remove(self):
+        """Permanently delete the selected trash items from the Recycle Bin (frees disk space)."""
+        ids = _clean_ids(self._read_body().get("ids", []))
+        if not ids:
+            self._json({"error": "No ids provided"}, 400)
+            return
+        try:
+            entries = _trash_entries(ids)
+        except Exception as e:
+            self._json({"error": str(e)}, 500)
+            return
+        self._empty_bin_entries(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +998,25 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 # Entry Point
 # ---------------------------------------------------------------------------
 def main():
+    global _HTML_BYTES
+    try:
+        with open(DASHBOARD_HTML, "rb") as f:
+            _HTML_BYTES = f.read()
+    except FileNotFoundError:
+        print(f"[WARN] dashboard.html not found at {DASHBOARD_HTML}", file=sys.stderr)
+
     init_db()
+
+    # A previous scan's results are still in the DB — show them instead of "No scan data".
+    try:
+        conn = get_db()
+        last = conn.execute("SELECT status FROM scan_meta ORDER BY started_at DESC LIMIT 1").fetchone()
+        conn.close()
+        if last and last["status"] == "complete":
+            STATE.scan_status = "complete"
+            STATE.scan_pct = 100
+    except Exception:
+        pass
 
     # Start the progress dispatcher thread
     dispatcher = threading.Thread(target=_progress_dispatcher, daemon=True)
@@ -852,6 +1029,7 @@ def main():
         except Exception:
             pass
     threading.Thread(target=_prewarm, daemon=True).start()
+    threading.Thread(target=lambda: reconcile_trash_log(force=True), daemon=True).start()
 
     server = ThreadedHTTPServer(("127.0.0.1", PORT), DashboardHandler)
 
@@ -865,7 +1043,8 @@ def main():
         time.sleep(0.8)
         webbrowser.open(url)
 
-    threading.Thread(target=_open_browser, daemon=True).start()
+    if not os.environ.get("CLEANUP_NO_BROWSER"):
+        threading.Thread(target=_open_browser, daemon=True).start()
 
     try:
         server.serve_forever()
